@@ -6,11 +6,39 @@
 # Disable the AWS CLI v2 pager so commands don't block waiting for input
 export AWS_PAGER=""
 
+usage()
+{
+    cat <<EOF
+Usage: $(basename "$0") <properties-file-path> <region> [<aws-profile>] <stack-name>
+
+Deploys or updates the GitLab Runner CloudFormation stack described by a properties file.
+Stores the runner tokens (RunnersToken) as an SSM SecureString, uploads both Lambda
+functions to LambdaS3Bucket, then creates or updates the stack and waits for it to finish.
+
+Arguments:
+  properties-file-path  Settings for the stack; see sample-runner.properties
+  region                AWS region to deploy to, e.g. us-east-1
+  aws-profile           Optional AWS CLI profile. Without it, the AWS CLI's default
+                        credentials are used (environment variables, AWS_PROFILE,
+                        the default profile or an instance role)
+  stack-name            CloudFormation stack name
+
+Options:
+  -h, --help, -?        Show this help and exit
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help|-\?) usage; exit 0 ;;
+    esac
+done
+
 if [[ "$#" -lt 3 || "$#" -gt 4 ]]
 then
-    echo "Incorrect number of arguments"
-    echo "Usage: $0 <properties-file-path> <region> [<aws-profile>] <stack-name>"
-    echo "Without <aws-profile>, the AWS CLI's default credential chain is used (environment variables, AWS_PROFILE, the default profile or an instance role)."
+    echo "Incorrect number of arguments" >&2
+    echo "Usage: $(basename "$0") <properties-file-path> <region> [<aws-profile>] <stack-name>" >&2
+    echo "Run '$(basename "$0") --help' for details." >&2
     exit 1
 fi
 

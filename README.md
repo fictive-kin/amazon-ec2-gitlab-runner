@@ -39,7 +39,7 @@ It checks your local tools and AWS credentials, and infers the GitLab project an
 
 Re-running it for an existing stack reuses that properties file. Generated properties files are ignored by git. Runner tokens are never written to them; they are stored as an SSM SecureString at `/<stack-name>/runner-tokens`.
 
-The sections below describe the same steps done by hand.
+The sections below describe the same steps done by hand. Every script (`setup-runner.sh`, `deploy-runner.sh`, `cycle-runner.sh`) prints its usage with `--help`, `-h` or `-?`.
 
 ## Prerequisites
 For this walkthrough, you need the following: 

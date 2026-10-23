@@ -5,10 +5,36 @@
 
 set -e
 
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <runner-asg-name> <region> [<aws-profile>]
+
+Replaces every instance in the runner autoscaling group with an instance refresh, so new
+instances pick up changes such as new runner tokens. Running jobs finish first: each
+instance is unregistered and stopped gracefully by the termination lifecycle hook.
+
+Arguments:
+  runner-asg-name   Autoscaling group name (<stack-name>-asg)
+  region            AWS region of the stack, e.g. us-east-1
+  aws-profile       Optional AWS CLI profile. Without it, the AWS CLI's default
+                    credentials are used
+
+Options:
+  -h, --help, -?    Show this help and exit
+EOF
+}
+
+for arg in "$@"; do
+  case "${arg}" in
+    -h|--help|-\?) usage; exit 0 ;;
+  esac
+done
+
 if [[ "$#" -lt 2 || "$#" -gt 3 ]]
 then
-    echo "Incorrect number of arguments"
-    echo "Usage: $0 <runner-asg-name> <region> <optional-aws-profile>"
+    echo "Incorrect number of arguments" >&2
+    echo "Usage: $(basename "$0") <runner-asg-name> <region> [<aws-profile>]" >&2
+    echo "Run '$(basename "$0") --help' for details." >&2
     exit 1
 fi
 

@@ -9,6 +9,40 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-h|--help|-?]
+
+Interactive setup that takes a GitLab Runner stack from nothing to deployed:
+  - checks local tools and AWS credentials
+  - infers the GitLab project and stack name from the git remote (both can be changed)
+  - creates the GitLab runner through the API, or prints the manual steps and asks for its token
+  - builds and pushes the executor image for linux/amd64
+  - lists VPCs and subnets, labelled public or private-nat, for you to pick from
+  - creates the Lambda S3 bucket and the Auto Scaling service-linked role if missing
+  - writes <stack-name>.properties and runs deploy-runner.sh
+
+Every value is prompted for, with a default shown in [brackets]. Re-running for an existing
+stack reuses its properties file and can keep the runner tokens already stored in SSM.
+
+Optional, prompted for during the run:
+  AWS profile               Leave empty to use the AWS CLI's default credentials
+                            (environment variables, AWS_PROFILE or the default profile)
+  GitLab access token       Scopes create_runner, read_api and write_registry; lets the
+                            script create the runner and log in to the registry for you
+
+Options:
+  -h, --help, -?            Show this help and exit
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help|-\?) usage; exit 0 ;;
+        *) echo "Unknown argument: ${arg}" >&2; echo "Run '$(basename "$0") --help' for usage." >&2; exit 1 ;;
+    esac
+done
+
 cd "$(dirname "$0")"
 
 export AWS_PAGER=""
