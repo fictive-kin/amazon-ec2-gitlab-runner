@@ -384,6 +384,48 @@ configure_runner_tokens() {
     esac
 }
 
+# check_registry_push USER TOKEN
+# docker login only checks that credentials are valid, not what they can do. This makes the same
+# token request docker makes before a push and reports whether push was granted.
+# Returns 0 if push is granted, 1 if it is not (explained), 2 if it couldn't be checked.
+check_registry_push() {
+    local repository status granted
+    repository=${DOCKER_IMAGE_PATH#*/}
+    repository=${repository%:*}
+    # Credentials go in a curl config file so they don't appear in the process list
+    printf 'user = "%s:%s"\n' "$1" "$2" > "${TEMP_DIR}/registry-auth"
+    status=$(curl -sS -K "${TEMP_DIR}/registry-auth" -o "${TEMP_DIR}/registry-token.json" -w '%{http_code}' -G \
+        --data-urlencode "service=container_registry" \
+        --data-urlencode "scope=repository:${repository}:push,pull" \
+        "${GITLAB_URL}/jwt/auth" 2> /dev/null || true)
+    rm -f "${TEMP_DIR}/registry-auth"
+
+    if [ "${status}" = "401" ]; then
+        warn "GitLab rejected the deploy token username or token."
+        return 1
+    fi
+    if [ "${status}" != "200" ]; then
+        warn "Couldn't check push access to ${repository} (HTTP ${status:-error}); trying the push anyway."
+        return 2
+    fi
+
+    # The registry token is a JWT; its payload lists the actions granted on the repository
+    granted=$(jq -r --arg repo "${repository}" '.token // empty | split(".")[1]
+        | gsub("-"; "+") | gsub("_"; "/") | (. + ("=" * ((4 - length % 4) % 4))) | @base64d | fromjson
+        | [.access[]? | select(.name == $repo) | .actions[]] | join(",")' "${TEMP_DIR}/registry-token.json" 2> /dev/null || true)
+    case ",${granted}," in
+        *,push,*)
+            ok "The deploy token can push to ${repository}"
+            return 0 ;;
+    esac
+    warn "The deploy token can't push to ${repository} (granted: ${granted:-nothing}). Check that:"
+    warn "  - it has the write_registry scope (read_registry alone can't push)"
+    warn "  - it was created in the project that owns the image, or in a group that contains it"
+    warn "  - the project's container registry is enabled (Settings > General > Visibility, project"
+    warn "    features, permissions > Container registry)"
+    return 1
+}
+
 configure_executor_image() {
     step "Executor image (the Docker image CI jobs run in)"
     local default_image=""
@@ -411,10 +453,15 @@ configure_executor_image() {
             "Click 'Add token'. Give it a name and an expiry date, and select the scope 'write_registry'" \
             "Click 'Create deploy token' and copy the username and the token (the token is only shown once)"
         local deploy_user deploy_token
-        ask deploy_user "Deploy token username" ""
-        ask_secret deploy_token "Deploy token"
+        while true; do
+            ask deploy_user "Deploy token username" ""
+            ask_secret deploy_token "Deploy token"
+            check_registry_push "${deploy_user}" "${deploy_token}" && break
+            [ $? -eq 2 ] && break
+            confirm "Enter a different deploy token?" y || die "No deploy token that can push to ${DOCKER_IMAGE_PATH%%:*}."
+        done
         printf '%s' "${deploy_token}" | docker login "${registry}" --username "${deploy_user}" --password-stdin > /dev/null \
-            || die "docker login to ${registry} failed. Check the username, and that the deploy token has the write_registry scope."
+            || die "docker login to ${registry} failed. Check the deploy token username and token."
         ok "Logged in to ${registry} as ${deploy_user}"
     else
         info "Logging in to ${registry} (skip with Ctrl+D if you are already logged in)..."
@@ -422,8 +469,13 @@ configure_executor_image() {
     fi
 
     # The runners are x86 (t3a); build for amd64 even on Apple Silicon
-    docker buildx build --platform linux/amd64 -t "${DOCKER_IMAGE_PATH}" --push . \
-        || die "Building or pushing ${DOCKER_IMAGE_PATH} failed."
+    if ! docker buildx build --platform linux/amd64 -t "${DOCKER_IMAGE_PATH}" --push .; then
+        warn "If the error above says 'insufficient_scope' or 'push access denied', the docker credentials"
+        warn "for ${registry} can't push to ${DOCKER_IMAGE_PATH%%:*}. Re-run and log in with a deploy"
+        warn "token from that project that has the write_registry scope, and check the project's container"
+        warn "registry is enabled (Settings > General > Visibility, project features, permissions)."
+        die "Building or pushing ${DOCKER_IMAGE_PATH} failed."
+    fi
     ok "Pushed ${DOCKER_IMAGE_PATH}"
 }
 
