@@ -237,7 +237,8 @@ configure_gitlab() {
     echo
     info "Optional: a GitLab personal access token lets this script look up the project and create"
     info "the runner for you. It is only used during this run. Use a ${BOLD}fine-grained${RESET} token:"
-    info "  1. In GitLab, select your avatar > Edit profile > Access > Personal access tokens"
+    info "  1. Open ${GITLAB_URL}/-/user_settings/personal_access_tokens"
+    info "     (or select your avatar > Edit profile > Access > Personal access tokens)"
     info "  2. Open the 'Generate token' dropdown, choose 'Fine-grained token' and set a short expiry date"
     info "  3. Under 'Group and project access', add ${GITLAB_PROJECT_PATH} with the permission ${BOLD}Project: Read${RESET}"
     info "  4. On the 'User' tab, add the permission ${BOLD}Runner: Create${RESET}"
@@ -246,16 +247,21 @@ configure_gitlab() {
     ask_secret GITLAB_TOKEN "Personal access token (leave empty to do those steps manually)"
     if [ -n "${GITLAB_TOKEN}" ]; then
         printf 'PRIVATE-TOKEN: %s\n' "${GITLAB_TOKEN}" > "${TEMP_DIR}/gitlab-auth-header"
+        # Show what was read without revealing it: the type prefix (e.g. glpat-) is not secret
+        local prefix=""
+        [[ "${GITLAB_TOKEN}" == *-* ]] && prefix="${GITLAB_TOKEN%%-*}-"
+        info "Read a ${#GITLAB_TOKEN}-character token${prefix:+ starting with ${prefix}}"
     fi
 
     GITLAB_PROJECT_ID=""
     GITLAB_PROJECT_WEB_URL="${GITLAB_URL}/${GITLAB_PROJECT_PATH}"
     GITLAB_REGISTRY_PREFIX=""
-    local encoded status
+    local encoded status message
     local args=(-sS -o "${TEMP_DIR}/project.json" -w '%{http_code}')
     [ -n "${GITLAB_TOKEN}" ] && args+=(-H "@${TEMP_DIR}/gitlab-auth-header")
     encoded=$(jq -rn --arg p "${GITLAB_PROJECT_PATH}" '$p|@uri')
     status=$(curl "${args[@]}" "${GITLAB_URL}/api/v4/projects/${encoded}" 2> /dev/null || true)
+    message=$(jq -r '.message // .error_description // .error // empty | tostring' "${TEMP_DIR}/project.json" 2> /dev/null || true)
     case "${status}" in
         200)
             GITLAB_PROJECT_ID=$(jq -r '.id' "${TEMP_DIR}/project.json")
@@ -268,10 +274,15 @@ configure_gitlab() {
             warn "Continuing without it; the steps it would have done will show manual instructions."
             GITLAB_TOKEN=""
             rm -f "${TEMP_DIR}/gitlab-auth-header" ;;
+        403)
+            warn "GitLab accepted the token but denied access to ${GITLAB_PROJECT_PATH}:"
+            warn "  ${message:-403 Forbidden}"
+            warn "Edit the token so it has Project: Read on this project (under 'Group and project access')."
+            warn "Continuing with the path as entered." ;;
         *)
             if [ -n "${GITLAB_TOKEN}" ]; then
-                warn "Could not look up ${GITLAB_PROJECT_PATH} (HTTP ${status:-error}). Check the path, and that the token"
-                warn "has the Project: Read permission on it. Continuing with the path as entered."
+                warn "Could not look up ${GITLAB_PROJECT_PATH} (HTTP ${status:-error}${message:+: ${message}})."
+                warn "Check the path, and that the token has Project: Read on it. Continuing with the path as entered."
             else
                 warn "Could not look up ${GITLAB_PROJECT_PATH} (a private project needs a token, or the path has a typo)."
                 warn "Continuing with the path as entered."
