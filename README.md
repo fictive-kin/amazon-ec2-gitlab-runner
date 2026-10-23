@@ -31,8 +31,8 @@ Run the interactive setup script from the root of this repository:
 ./setup-runner.sh
 ```
 It checks your local tools and AWS credentials, and infers the GitLab project and stack name from the git remote. Then it:
-- creates the GitLab runner (with a personal access token) or tells you how to create it and asks for the token;
-- builds and pushes the executor image for linux/amd64;
+- creates the GitLab runner (with a fine-grained personal access token that has Project: Read and Runner: Create) or tells you how to create it and asks for the token;
+- builds and pushes the executor image for linux/amd64, logging in with a project deploy token that has the write_registry scope (fine-grained tokens can't push images);
 - lets you pick a VPC and subnets (public or private with NAT);
 - creates the Lambda S3 bucket if needed;
 - writes `<stack-name>.properties` and runs `deploy-runner.sh`.

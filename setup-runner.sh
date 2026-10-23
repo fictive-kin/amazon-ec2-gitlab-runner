@@ -28,9 +28,11 @@ stack reuses its properties file and can keep the runner tokens already stored i
 Optional, prompted for during the run:
   AWS profile               Leave empty to use the AWS CLI's default credentials
                             (environment variables, AWS_PROFILE or the default profile)
-  GitLab access token       A legacy personal access token with the scopes create_runner,
-                            read_api and write_registry (or api); lets the script create
-                            the runner and log in to the registry for you
+  GitLab access token       A fine-grained personal access token with Project: Read on the
+                            project and Runner: Create; lets the script look up the project
+                            and create the runner for you
+  Registry deploy token     A project deploy token with the write_registry scope, to push
+                            the executor image (fine-grained tokens can't push images)
 
 Options:
   -h, --help, -?            Show this help and exit
@@ -233,76 +235,50 @@ configure_gitlab() {
     GITLAB_PROJECT_PATH=${GITLAB_PROJECT_PATH%/}
 
     echo
-    info "Optional: a GitLab personal access token lets this script look up the project, create the"
-    info "runner for you, and log in to the container registry. It is only used during this run."
-    info "It must be a ${BOLD}legacy${RESET} token; fine-grained tokens don't have the scopes below. To create one:"
+    info "Optional: a GitLab personal access token lets this script look up the project and create"
+    info "the runner for you. It is only used during this run. Use a ${BOLD}fine-grained${RESET} token:"
     info "  1. In GitLab, select your avatar > Edit profile > Access > Personal access tokens"
-    info "  2. Open the 'Generate token' dropdown and choose 'Legacy token'"
-    info "     (older GitLab versions have no dropdown; the page may be under Preferences > Access tokens)"
-    info "  3. Select the scopes ${BOLD}create_runner${RESET}, ${BOLD}read_api${RESET} and ${BOLD}write_registry${RESET} (or just ${BOLD}api${RESET}),"
-    info "     set a short expiry date, and create it"
-    info "  Shortcut that pre-fills the form on recent GitLab versions (if it 404s, use the steps above):"
-    info "  ${DIM}${GITLAB_URL}/-/user_settings/personal_access_tokens?name=gitlab-runner-setup&scopes=create_runner,read_api,write_registry${RESET}"
+    info "  2. Open the 'Generate token' dropdown, choose 'Fine-grained token' and set a short expiry date"
+    info "  3. Under 'Group and project access', add ${GITLAB_PROJECT_PATH} with the permission ${BOLD}Project: Read${RESET}"
+    info "  4. On the 'User' tab, add the permission ${BOLD}Runner: Create${RESET}"
+    info "  ${DIM}On GitLab versions without fine-grained tokens, use a legacy token with the scopes${RESET}"
+    info "  ${DIM}create_runner and read_api instead.${RESET}"
     ask_secret GITLAB_TOKEN "Personal access token (leave empty to do those steps manually)"
     if [ -n "${GITLAB_TOKEN}" ]; then
         printf 'PRIVATE-TOKEN: %s\n' "${GITLAB_TOKEN}" > "${TEMP_DIR}/gitlab-auth-header"
-        check_gitlab_token
     fi
 
     GITLAB_PROJECT_ID=""
     GITLAB_PROJECT_WEB_URL="${GITLAB_URL}/${GITLAB_PROJECT_PATH}"
     GITLAB_REGISTRY_PREFIX=""
-    local encoded project_json
+    local encoded status
+    local args=(-sS -o "${TEMP_DIR}/project.json" -w '%{http_code}')
+    [ -n "${GITLAB_TOKEN}" ] && args+=(-H "@${TEMP_DIR}/gitlab-auth-header")
     encoded=$(jq -rn --arg p "${GITLAB_PROJECT_PATH}" '$p|@uri')
-    if project_json=$(gitlab_api GET "/projects/${encoded}" 2> /dev/null); then
-        GITLAB_PROJECT_ID=$(echo "${project_json}" | jq -r '.id')
-        GITLAB_PROJECT_PATH=$(echo "${project_json}" | jq -r '.path_with_namespace')
-        GITLAB_PROJECT_WEB_URL=$(echo "${project_json}" | jq -r '.web_url')
-        GITLAB_REGISTRY_PREFIX=$(echo "${project_json}" | jq -r '.container_registry_image_prefix // empty')
-        ok "Found project ${GITLAB_PROJECT_PATH} (id ${GITLAB_PROJECT_ID})"
-    else
-        warn "Could not look up ${GITLAB_PROJECT_PATH} through the GitLab API (private project without a token, or a typo)."
-        warn "Continuing with the path as entered."
-    fi
+    status=$(curl "${args[@]}" "${GITLAB_URL}/api/v4/projects/${encoded}" 2> /dev/null || true)
+    case "${status}" in
+        200)
+            GITLAB_PROJECT_ID=$(jq -r '.id' "${TEMP_DIR}/project.json")
+            GITLAB_PROJECT_PATH=$(jq -r '.path_with_namespace' "${TEMP_DIR}/project.json")
+            GITLAB_PROJECT_WEB_URL=$(jq -r '.web_url' "${TEMP_DIR}/project.json")
+            GITLAB_REGISTRY_PREFIX=$(jq -r '.container_registry_image_prefix // empty' "${TEMP_DIR}/project.json")
+            ok "Found project ${GITLAB_PROJECT_PATH} (id ${GITLAB_PROJECT_ID})" ;;
+        401)
+            warn "${GITLAB_URL} rejected the access token (typo, expired, revoked, or a token for another GitLab server)."
+            warn "Continuing without it; the steps it would have done will show manual instructions."
+            GITLAB_TOKEN=""
+            rm -f "${TEMP_DIR}/gitlab-auth-header" ;;
+        *)
+            if [ -n "${GITLAB_TOKEN}" ]; then
+                warn "Could not look up ${GITLAB_PROJECT_PATH} (HTTP ${status:-error}). Check the path, and that the token"
+                warn "has the Project: Read permission on it. Continuing with the path as entered."
+            else
+                warn "Could not look up ${GITLAB_PROJECT_PATH} (a private project needs a token, or the path has a typo)."
+                warn "Continuing with the path as entered."
+            fi ;;
+    esac
     if [ -z "${GITLAB_REGISTRY_PREFIX}" ] && [ "${GITLAB_URL}" = "https://gitlab.com" ]; then
         GITLAB_REGISTRY_PREFIX="registry.gitlab.com/$(echo "${GITLAB_PROJECT_PATH}" | tr '[:upper:]' '[:lower:]')"
-    fi
-}
-
-# Checks the access token against GitLab and reports any scopes the automatic steps need but it lacks.
-# Steps a token can't do fall back to manual instructions, so this only warns.
-check_gitlab_token() {
-    local status scopes missing=()
-    status=$(curl -sS -o "${TEMP_DIR}/token.json" -w '%{http_code}' -H "@${TEMP_DIR}/gitlab-auth-header" \
-        "${GITLAB_URL}/api/v4/personal_access_tokens/self" 2> /dev/null || true)
-    if [ "${status}" = "401" ]; then
-        warn "${GITLAB_URL} rejected the access token (typo, expired, revoked, or a token for another GitLab server)."
-        warn "Continuing without it; the steps it would have done will show manual instructions."
-        GITLAB_TOKEN=""
-        rm -f "${TEMP_DIR}/gitlab-auth-header"
-        return 0
-    fi
-    if [ "${status}" != "200" ]; then
-        warn "Couldn't check the access token's scopes (HTTP ${status:-error}); continuing with it."
-        return 0
-    fi
-
-    scopes=$(jq -r '(.scopes // []) | join(",")' "${TEMP_DIR}/token.json")
-    if [ -z "${scopes}" ]; then
-        warn "This token has no scopes (fine-grained tokens don't). Steps it can't do will fall back to manual."
-        return 0
-    fi
-    for scope in create_runner read_api write_registry; do
-        case ",${scopes}," in
-            *",${scope},"*|*",api,"*) ;;
-            *) missing+=("${scope}") ;;
-        esac
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        warn "The access token is missing the scope(s): ${missing[*]} (it has: ${scopes})."
-        warn "Steps that need them will fall back to manual instructions."
-    else
-        ok "Access token has the scopes needed (${scopes})"
     fi
 }
 
@@ -369,8 +345,9 @@ configure_runner_tokens() {
         if create_runner_with_api; then
             return 0
         fi
-        warn "Creating the runner through the API failed (the token needs the create_runner scope"
-        warn "and you need the Maintainer role on the project). Falling back to the manual steps."
+        warn "Creating the runner through the API failed. The token needs the Runner: Create permission"
+        warn "(create_runner scope on a legacy token), and you need the Maintainer role on the project."
+        warn "Falling back to the manual steps."
     fi
 
     manual_step "Create the runner in GitLab and copy its token" \
@@ -408,13 +385,26 @@ configure_executor_image() {
         return 0
     fi
 
+    # Fine-grained personal access tokens can't push images, so the push uses a project deploy token
+    # (or whatever credentials docker already has for the registry)
     local registry=${DOCKER_IMAGE_PATH%%/*}
-    if [ -n "${GITLAB_TOKEN}" ] && confirm "Log in to ${registry} with your personal access token?" y; then
-        local username
-        username=$(gitlab_api GET "/user" | jq -r '.username') || die "Could not look up your GitLab username."
-        printf '%s' "${GITLAB_TOKEN}" | docker login "${registry}" --username "${username}" --password-stdin > /dev/null \
-            || die "docker login to ${registry} failed. The token needs the write_registry scope."
-        ok "Logged in to ${registry} as ${username}"
+    info "Pushing needs registry credentials. Fine-grained access tokens can't push images; use a"
+    info "project deploy token with the write_registry scope, or credentials docker already has."
+    if confirm "Log in to ${registry} with a deploy token?" y; then
+        local open_step="In GitLab, open the project that owns ${DOCKER_IMAGE_PATH%%:*}, then Settings > Repository > Deploy tokens"
+        if [ -n "${GITLAB_REGISTRY_PREFIX}" ] && [[ "${DOCKER_IMAGE_PATH}" == "${GITLAB_REGISTRY_PREFIX}"/* ]]; then
+            open_step="Open ${GITLAB_PROJECT_WEB_URL}/-/settings/repository#js-deploy-tokens  (Settings > Repository > Deploy tokens)"
+        fi
+        manual_step "Create a deploy token that can push images" \
+            "${open_step}" \
+            "Click 'Add token'. Give it a name and an expiry date, and select the scope 'write_registry'" \
+            "Click 'Create deploy token' and copy the username and the token (the token is only shown once)"
+        local deploy_user deploy_token
+        ask deploy_user "Deploy token username" ""
+        ask_secret deploy_token "Deploy token"
+        printf '%s' "${deploy_token}" | docker login "${registry}" --username "${deploy_user}" --password-stdin > /dev/null \
+            || die "docker login to ${registry} failed. Check the username, and that the deploy token has the write_registry scope."
+        ok "Logged in to ${registry} as ${deploy_user}"
     else
         info "Logging in to ${registry} (skip with Ctrl+D if you are already logged in)..."
         docker login "${registry}" || warn "docker login did not succeed; the push below will fail if you are not logged in."
