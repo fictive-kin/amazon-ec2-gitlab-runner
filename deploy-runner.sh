@@ -50,7 +50,8 @@ callCloudFormation()
             ParameterKey=CheckInterval,ParameterValue=${CheckInterval} \
             ParameterKey=CostCenter,ParameterValue=${CostCenter} \
             ParameterKey=AppId,ParameterValue=${AppId} \
-            ParameterKey=GitlabRunnerVersion,ParameterValue=${GitlabRunnerVersion:-latest}
+            ParameterKey=GitlabRunnerVersion,ParameterValue=${GitlabRunnerVersion:-latest} \
+            ParameterKey=AssociatePublicIpAddress,ParameterValue=${AssociatePublicIpAddress:-false}
 }
 
 verifyStackSuccess()

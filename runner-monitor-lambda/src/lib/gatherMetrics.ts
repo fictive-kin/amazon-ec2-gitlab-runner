@@ -1,7 +1,12 @@
 // assumptions: < 100 ec2 instances to support the gitlab runners
 
-import {fetchUrl, sumReducer} from "./utils";
-import {Ec2InstanceInfo, getAutoscalingGroupInfo, getEc2InstanceInfo} from "./asgInfo";
+import * as cw from "@aws-sdk/client-cloudwatch";
+import * as config from "./config";
+import {sumReducer} from "./utils";
+import {getAutoscalingGroupInfo} from "./asgInfo";
+
+// Instances publish every 30 seconds; allow a few missed publishes before treating one as unhealthy
+const maximumMetricAgeSeconds = 180
 
 interface InstanceMetrics {
     instanceId: string
@@ -33,24 +38,7 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
     }
 
     console.log(`Instances in autoscaling group: ${asgInfo.instanceIds.length}`)
-    const runnerInstanceInfo = await getEc2InstanceInfo(asgInfo.instanceIds)
-    if (runnerInstanceInfo.length == 0) {
-        console.log("no runner instances are available in the autoScalingGroup")
-        return {
-            currentJobCount: 0,
-            currentInstances: asgInfo.currentCapacity,
-            activeInstances: 0,
-            minInstances: asgInfo.minSize,
-            maxInstances: asgInfo.maxSize,
-            instances: [],
-        }
-    }
-
-    const asyncMetrics = runnerInstanceInfo.map((instance) => {
-        return getMetricsForInstance(instance)
-    })
-
-    const metrics = await Promise.all(asyncMetrics)
+    const metrics = await getInstanceMetrics(autoScalingGroupName, asgInfo.instanceIds)
 
     console.log(`All metrics retrieved`)
 
@@ -76,48 +64,60 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
     }
 }
 
-const getMetricsForInstance = async (instance: Ec2InstanceInfo): Promise<InstanceMetrics> => {
-    const prometheusUrl = `http://${instance.privateIpAddress}:9252/metrics`
-    try {
-        console.log(`Fetching metrics from url: ${prometheusUrl}`)
-        const prometheusContent = await fetchUrl(prometheusUrl)
+// Each runner instance publishes its own running job count to CloudWatch (see the
+// publish-runner-metrics timer in gitlab-runner.yaml). An instance with no recent datapoint
+// is still booting or unhealthy, and is treated the same as a failed metrics scrape.
+const getInstanceMetrics = async (autoScalingGroupName: string, instanceIds: string[]): Promise<InstanceMetrics[]> => {
+    const client = new cw.CloudWatchClient({
+        tls: true,
+    })
 
-        const buildCount = countCurrentBuilds(prometheusContent)
-        console.log(`For url: ${prometheusUrl} Build Count is ${buildCount}`)
-        return {
-            instanceId : instance.instanceId,
-            jobCount : buildCount,
-            error: null,
-        }
-    } catch (ex) {
-        if (ex instanceof Error) {
-            console.log(`Error getting metrics from url ${prometheusUrl}, error: ${ex}`)
+    const now = new Date()
+    const command = new cw.GetMetricDataCommand({
+        StartTime: new Date(now.getTime() - 5 * 60 * 1000),
+        EndTime: now,
+        ScanBy: cw.ScanBy.TIMESTAMP_DESCENDING,
+        MetricDataQueries: instanceIds.map((instanceId, index): cw.MetricDataQuery => {
             return {
-                instanceId: instance.instanceId,
-                jobCount: 0,
-                error: ex.toString()
+                Id: `instance${index}`,
+                MetricStat: {
+                    Metric: {
+                        Namespace: config.runnerMetricNamespace(),
+                        MetricName: config.runnerInstanceJobCountMetricName(),
+                        Dimensions: [
+                            {Name: "AutoScalingGroupName", Value: autoScalingGroupName},
+                            {Name: "InstanceId", Value: instanceId},
+                        ],
+                    },
+                    Period: 60,
+                    Stat: "Maximum",
+                },
             }
-        } else {
-            throw ex
-        }
-    }
-}
+        }),
+    })
 
-const countCurrentBuilds = (prometheusContent: string): number => {
-    const contentLines = prometheusContent.split('\n')
-    const buildCount = contentLines
-        .filter((line) => {
-            // Find the lines that correspond to the job counts
-            return line.startsWith("gitlab_runner_jobs{")
-        })
-        .map((line) => {
-            // The last field in this line is the # of builds
-            const lineParts = line.split(' ')
-            const counterText = lineParts[lineParts.length - 1]
-            return parseInt(counterText)
-        })
-        .reduce(sumReducer, 0)
-    return buildCount
+    const response = await client.send(command)
+    const results = response.MetricDataResults || []
+
+    return instanceIds.map((instanceId, index): InstanceMetrics => {
+        const result = results.find(r => r.Id == `instance${index}`)
+        const latestTimestamp = result?.Timestamps?.[0]
+        const latestValue = result?.Values?.[0]
+
+        if (latestTimestamp == null || latestValue == null) {
+            console.log(`No job count metric found for instance ${instanceId}`)
+            return {instanceId, jobCount: 0, error: "no job count metric found"}
+        }
+
+        const ageSeconds = (now.getTime() - latestTimestamp.getTime()) / 1000
+        if (ageSeconds > maximumMetricAgeSeconds) {
+            console.log(`Job count metric for instance ${instanceId} is stale (${ageSeconds}s old)`)
+            return {instanceId, jobCount: 0, error: "job count metric is stale"}
+        }
+
+        console.log(`For instance: ${instanceId} Build Count is ${latestValue}`)
+        return {instanceId, jobCount: latestValue, error: null}
+    })
 }
 
 export const instanceHasErrors = (instance : InstanceMetrics) : boolean => {

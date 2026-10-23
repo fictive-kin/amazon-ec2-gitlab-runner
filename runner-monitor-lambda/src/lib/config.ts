@@ -35,6 +35,14 @@ export const runnerMetricNamespace = () : string => {
     throw Error("Environment Variable RUNNER_METRIC_NAMESPACE not found")
 }
 
+// per-instance running job count, published by each runner instance
+export const runnerInstanceJobCountMetricName = () : string => {
+    if (process.env.RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME) {
+        return process.env.RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME
+    }
+    throw Error("Environment Variable RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME not found")
+}
+
 export const runnerJobCountMetricName = () : string => {
     if (process.env.RUNNER_JOB_COUNT_METRIC_NAME) {
         return process.env.RUNNER_JOB_COUNT_METRIC_NAME

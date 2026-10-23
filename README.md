@@ -44,7 +44,7 @@ For this walkthrough, you need the following:
 - The latest version of the AWS CLI. For more information, see [Installing, updating, and uninstalling the AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html).
 - Docker is installed and running on the localhost/laptop.
 - Nodejs and npm installed on the localhost/laptop. 
-- A VPC with 2 private subnets and that is connected to the internet via NAT gateway allowing outbound traffic.  
+- A VPC with 2 subnets that allow outbound internet traffic. Either private subnets behind a NAT gateway, or public subnets with `AssociatePublicIpAddress=true` in the properties file (no NAT gateway needed).  
 - The following IAM service-linked role created in the AWS account: AWSServiceRoleForAutoScaling
 - An S3 bucket for storing Lambda deployment packages. 
 - Familiarity with Git, Gitlab CI/CD, Docker, EC2, and CloudFormation.
@@ -164,7 +164,7 @@ To remove projects from the Gitlab Runner, follow the steps described above, wit
 ## Autoscale the runner based on custom performance metrics
 Each Gitlab Runner can be configured to handle a fixed number of [concurrent jobs](https://docs.gitlab.com/runner/configuration/advanced-configuration.html). Once this capacity is reached for every runner, any new jobs will be in a Queued/Waiting status until the current jobs complete, which would be a poor experience for our team. Setting the number of concurrent jobs too high on our runners would also result in a poor experience, because all jobs leverage the same CPU, memory, and storage in order to conduct the builds.
 
-In this solution, we utilize a scheduled Lambda function that runs every minute in order to inspect the number of jobs running on every runner, leveraging the [Prometheus Metrics](https://docs.gitlab.com/ee/administration/monitoring/prometheus/gitlab_metrics.html#gitlab-prometheus-metrics) endpoint that the runners expose. If we approach the concurrent build limit of the group, then we increase the Autoscaling Group size so that it can take on more work. As the number of concurrent jobs decreases, then the scheduled Lambda function will scale the Autoscaling Group back in an effort to minimize cost. The Scaling-Up operation will ignore the Autoscaling Group’s cooldown period, which will help ensure that our team is not waiting on a new instance, whereas the Scale-Down operation will obey the group’s cooldown period.
+In this solution, we utilize a scheduled Lambda function that runs every minute in order to inspect the number of jobs running on every runner. Each runner reads its job count from its local [Prometheus Metrics](https://docs.gitlab.com/ee/administration/monitoring/prometheus/gitlab_metrics.html#gitlab-prometheus-metrics) endpoint and publishes it to CloudWatch every 30 seconds, and the Lambda function reads those metrics, so it does not need to run inside the VPC. A runner that has not published recently is treated as unavailable. If we approach the concurrent build limit of the group, then we increase the Autoscaling Group size so that it can take on more work. As the number of concurrent jobs decreases, then the scheduled Lambda function will scale the Autoscaling Group back in an effort to minimize cost. The Scaling-Up operation will ignore the Autoscaling Group’s cooldown period, which will help ensure that our team is not waiting on a new instance, whereas the Scale-Down operation will obey the group’s cooldown period.
 
 Here is the logical sequence diagram for the work:
 

@@ -90,6 +90,13 @@ Parameters:
     Type: Number
     Default: 2
     Description: The number of jobs that we should be able to take before needing to wait on a scaling event.
+  AssociatePublicIpAddress:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Give runner instances a public IP. Set to "true" when SubnetIds are public subnets without a NAT gateway.
   GitlabRunnerVersion:
     Type: String
     Default: "latest"
@@ -149,6 +156,13 @@ Resources:
               - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
               - !Sub 'arn:aws:ssm:*:${AWS::AccountId}:document/${Document}'
             Effect: Allow            
+          - Sid: AllowPublishRunnerMetrics
+            Action: 'cloudwatch:PutMetricData'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'cloudwatch:namespace': !Sub '${AWS::StackName}-runner-metrics'
+            Effect: Allow
           - Sid: AllowCompleteLifycycle
             Action: 'autoscaling:CompleteLifecycleAction'
             Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-asg'
@@ -170,30 +184,6 @@ Resources:
       GroupDescription: !Join [ "", [ "Security group for ", !Ref "InstanceName" ] ]
       VpcId: !Ref "VpcID"
 
-  RunnerMonitorSecurityGroup:
-    Type: "AWS::EC2::SecurityGroup"
-    Properties:
-      GroupDescription: !Join [ "", [ "Security group for Gitlab Runner Monitor for ", !Ref "InstanceName" ] ]
-      VpcId: !Ref "VpcID"
-
-  AllowRunnerMonitorToRunner:
-    Type: "AWS::EC2::SecurityGroupIngress"
-    Properties:
-      Description: "Allow Runner Monitor to access the metric port on the runner"
-      GroupId: !Ref RunnerSecurityGroup
-      FromPort: 9252
-      ToPort: 9252
-      IpProtocol: "tcp"
-      SourceSecurityGroupId: !Ref RunnerMonitorSecurityGroup
-
-  AllowRunnerMonitorToInternet:
-    Type: "AWS::EC2::SecurityGroupEgress"
-    Properties:
-      Description: "Allow Runner Monitor to access the internet for gitlab/metrics"
-      GroupId: !Ref RunnerMonitorSecurityGroup
-      CidrIp: "0.0.0.0/0"
-      IpProtocol: "-1"
-
   RunnerLaunchTemplate:
     Type: 'AWS::EC2::LaunchTemplate'
     DependsOn: GitlabRunnerRole
@@ -214,8 +204,11 @@ Resources:
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 2
-        SecurityGroupIds:
-          - !GetAtt RunnerSecurityGroup.GroupId
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+            Groups:
+              - !GetAtt RunnerSecurityGroup.GroupId
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash -xe
@@ -245,8 +238,45 @@ Resources:
               content: !Sub |
                 concurrent = ${Concurrent}
                 check_interval = ${CheckInterval}
-                listen_address = ":9252"
+                listen_address = "127.0.0.1:9252"
                 log_format = "json"
+            # Publishes this instance's running job count for the runner monitor Lambda to scale on
+            /usr/local/bin/publish-runner-metrics:
+              mode: '000755'
+              content: !Sub |
+                #!/bin/bash
+                set -euo pipefail
+                TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+                INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
+                JOB_COUNT=$(curl -sf http://127.0.0.1:9252/metrics | awk 'index($0, "gitlab_runner_jobs{") == 1 { sum += $NF } END { print sum + 0 }')
+                aws cloudwatch put-metric-data \
+                  --region ${AWS::Region} \
+                  --namespace "${AWS::StackName}-runner-metrics" \
+                  --metric-name "${AWS::StackName}-instance-job-count" \
+                  --dimensions "AutoScalingGroupName=${AWS::StackName}-asg,InstanceId=${!INSTANCE_ID}" \
+                  --unit Count \
+                  --value "${!JOB_COUNT}"
+            /etc/systemd/system/publish-runner-metrics.service:
+              content: |
+                [Unit]
+                Description=Publish GitLab Runner job count to CloudWatch
+                After=gitlab-runner.service
+
+                [Service]
+                Type=oneshot
+                ExecStart=/usr/local/bin/publish-runner-metrics
+            /etc/systemd/system/publish-runner-metrics.timer:
+              content: |
+                [Unit]
+                Description=Publish GitLab Runner job count to CloudWatch every 30 seconds
+
+                [Timer]
+                OnBootSec=30
+                OnUnitActiveSec=30
+                AccuracySec=1
+
+                [Install]
+                WantedBy=timers.target
             # https://docs.gitlab.com/runner/best_practice/#graceful-shutdown
             /etc/systemd/system/gitlab-runner.service.d/kill.conf:
               content: |
@@ -289,7 +319,9 @@ Resources:
                     --description "Gitlab Runner with Docker Executor" \
                     --docker-volumes "/var/run/docker.sock:/var/run/docker.sock"
                 done
-            10StartCfnHup:
+            10StartPublishRunnerMetrics:
+              command: systemctl daemon-reload && systemctl enable --now publish-runner-metrics.timer
+            11StartCfnHup:
               command: systemctl start cfn-hup && systemctl enable cfn-hup
   RunnerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -473,12 +505,12 @@ Resources:
                 Action:
                   - "autoscaling:DescribeAutoScalingGroups"
                   - "autoscaling:SetDesiredCapacity"
+                  - "cloudwatch:GetMetricData"
                   - "cloudwatch:PutMetricData"
-                  - "ec2:DescribeInstances"
                 Resource:
                   - "*"
       ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 
   RunnerMonitorLambda:
     Type: AWS::Lambda::Function
@@ -494,16 +526,13 @@ Resources:
       Timeout: 900
       MemorySize: 256
       ReservedConcurrentExecutions: 1
-      VpcConfig:
-        SecurityGroupIds:
-          - !GetAtt RunnerMonitorSecurityGroup.GroupId
-        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           AUTOSCALING_GROUP_NAME: !Ref RunnerAutoScalingGroup
           MAXIMUM_CONCURRENT_JOBS_PER_RUNNER: !Ref Concurrent
           COUNT_OF_NEW_JOBS_BEFORE_SCALING: !Ref CountOfNewJobsBeforeScaling
           RUNNER_METRIC_NAMESPACE: !Sub "${AWS::StackName}-runner-metrics"
+          RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-instance-job-count"
           RUNNER_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-job-count"
           RUNNER_TARGET_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-target-capacity"
           RUNNER_ACTUAL_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-actual-capacity"
