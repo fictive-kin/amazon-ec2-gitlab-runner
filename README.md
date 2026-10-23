@@ -25,6 +25,22 @@ The following diagram displays the solution architecture. It also shows the work
 
 5.	The user may repeat the same steps to deploy Gitlab Runner into another environment. 
 
+## Quick start
+Run the interactive setup script from the root of this repository:
+```
+./setup-runner.sh
+```
+It checks your local tools and AWS credentials, and infers the GitLab project and stack name from the git remote. Then it:
+- creates the GitLab runner (with a personal access token) or tells you how to create it and asks for the token;
+- builds and pushes the executor image for linux/amd64;
+- lets you pick a VPC and subnets (public or private with NAT);
+- creates the Lambda S3 bucket if needed;
+- writes `<stack-name>.properties` and runs `deploy-runner.sh`.
+
+Re-running it for an existing stack reuses that properties file. Generated properties files are ignored by git. Runner tokens are never written to them; they are stored as an SSM SecureString at `/<stack-name>/runner-tokens`.
+
+The sections below describe the same steps done by hand.
+
 ## Prerequisites
 For this walkthrough, you need the following: 
 - A Gitlab account (all tiers including Gitlab Free self-managed, Gitlab Free SaaS, and higher tiers). This demo uses gitlab.com free tier. 
@@ -143,23 +159,23 @@ The above command terminates the instance. The lifecycle hook ensures that the c
 Note that if you terminate the instance by using the "ec2 terminate-instance" command, then the autoscaling lifecycle hook actions will not be triggered.
 
 ## Add/Remove Gitlab projects from the Gitlab Runner 
-As new projects are added to your enterprise, you may want to register them to the Gitlab Runner, so that those projects can utilize the Gitlab Runner to run pipelines. On the other hand, you would want to remove the Gitlab Runner from a project if it no longer wants to utilize the Gitlab Runner, or if it qualifies to utilize the Gitlab Runner. For example, if a project is no longer allowed to deploy to an environment configured by the Gitlab Runner. Our architecture offers a simple way to add and remove projects from the Gitlab Runner. To add new projects to the Gitlab Runner, update the RunnerRegistrationTokens parameter in the properties file, and then rerun the deploy script to update the Gitlab Runner stack. 
+As new projects are added to your enterprise, you may want to register them to the Gitlab Runner, so that those projects can utilize the Gitlab Runner to run pipelines. On the other hand, you would want to remove the Gitlab Runner from a project if it no longer wants to utilize the Gitlab Runner, or if it qualifies to utilize the Gitlab Runner. For example, if a project is no longer allowed to deploy to an environment configured by the Gitlab Runner. Our architecture offers a simple way to add and remove projects from the Gitlab Runner. To add new projects to the Gitlab Runner, set the RunnersToken parameter in the properties file, and then rerun the deploy script to update the Gitlab Runner stack. 
 
 ### To add new projects to the Gitlab Runner:
-1.	Update the RunnerRegistrationTokens parameter in the properties file. For example: 
+1.	Set the RunnersToken parameter in the properties file to all of the runner authentication tokens, including the existing ones. For example: 
 ```
-RunnerRegistrationTokens=ps8RjBSruy1sdRdP2nZX,XbtZNv4yxysbYhqvjEkC
+RunnersToken=glrt-exampletoken1,glrt-exampletoken2
 ```
-2.	Update the Gitlab Runner stack. This updates the SSM parameter which stores the tokens. 
+2.	Update the Gitlab Runner stack. This overwrites the SecureString SSM parameter `/<stack-name>/runner-tokens` that stores the tokens. If RunnersToken is empty, the stored tokens are kept. 
 ```
 cd <your-repo-dir>
 ./deploy-runner.sh <properties-file> <region> <aws-profile> <stack-name> 
 ```
-3.	Relaunch the instances in the Gitlab Runner autoscaling group. The new instances will use the new RunnerRegistrationTokens value. Run the following command to relaunch the instances:
+3.	Relaunch the instances in the Gitlab Runner autoscaling group. The new instances will use the new RunnersToken value. Run the following command to relaunch the instances:
 ```
 ./cycle-runner.sh <runner-autoscaling-group-name> <region> <optional-aws-profile>
 ```
-To remove projects from the Gitlab Runner, follow the steps described above, with just one difference. Instead of adding new tokens to the RunnerRegistrationTokens parameter, remove the token(s) of the project that you want to dissociate from the runner.  
+To remove projects from the Gitlab Runner, follow the steps described above, with just one difference. Instead of adding new tokens to the RunnersToken parameter, remove the token(s) of the project that you want to dissociate from the runner.  
 
 ## Autoscale the runner based on custom performance metrics
 Each Gitlab Runner can be configured to handle a fixed number of [concurrent jobs](https://docs.gitlab.com/runner/configuration/advanced-configuration.html). Once this capacity is reached for every runner, any new jobs will be in a Queued/Waiting status until the current jobs complete, which would be a poor experience for our team. Setting the number of concurrent jobs too high on our runners would also result in a poor experience, because all jobs leverage the same CPU, memory, and storage in order to conduct the builds.
