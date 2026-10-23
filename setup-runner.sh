@@ -28,8 +28,9 @@ stack reuses its properties file and can keep the runner tokens already stored i
 Optional, prompted for during the run:
   AWS profile               Leave empty to use the AWS CLI's default credentials
                             (environment variables, AWS_PROFILE or the default profile)
-  GitLab access token       Scopes create_runner, read_api and write_registry; lets the
-                            script create the runner and log in to the registry for you
+  GitLab access token       A legacy personal access token with the scopes create_runner,
+                            read_api and write_registry (or api); lets the script create
+                            the runner and log in to the registry for you
 
 Options:
   -h, --help, -?            Show this help and exit
@@ -232,13 +233,20 @@ configure_gitlab() {
     GITLAB_PROJECT_PATH=${GITLAB_PROJECT_PATH%/}
 
     echo
-    info "Optional: a GitLab personal access token lets this script look up the project,"
-    info "create the runner for you, and log in to the container registry."
-    info "Create one at ${GITLAB_URL}/-/user_settings/personal_access_tokens with scopes:"
-    info "  ${BOLD}create_runner${RESET}, ${BOLD}read_api${RESET}, ${BOLD}write_registry${RESET}   (it is only used during this run)"
+    info "Optional: a GitLab personal access token lets this script look up the project, create the"
+    info "runner for you, and log in to the container registry. It is only used during this run."
+    info "It must be a ${BOLD}legacy${RESET} token; fine-grained tokens don't have the scopes below. To create one:"
+    info "  1. In GitLab, select your avatar > Edit profile > Access > Personal access tokens"
+    info "  2. Open the 'Generate token' dropdown and choose 'Legacy token'"
+    info "     (older GitLab versions have no dropdown; the page may be under Preferences > Access tokens)"
+    info "  3. Select the scopes ${BOLD}create_runner${RESET}, ${BOLD}read_api${RESET} and ${BOLD}write_registry${RESET} (or just ${BOLD}api${RESET}),"
+    info "     set a short expiry date, and create it"
+    info "  Shortcut that pre-fills the form on recent GitLab versions (if it 404s, use the steps above):"
+    info "  ${DIM}${GITLAB_URL}/-/user_settings/personal_access_tokens?name=gitlab-runner-setup&scopes=create_runner,read_api,write_registry${RESET}"
     ask_secret GITLAB_TOKEN "Personal access token (leave empty to do those steps manually)"
     if [ -n "${GITLAB_TOKEN}" ]; then
         printf 'PRIVATE-TOKEN: %s\n' "${GITLAB_TOKEN}" > "${TEMP_DIR}/gitlab-auth-header"
+        check_gitlab_token
     fi
 
     GITLAB_PROJECT_ID=""
@@ -258,6 +266,43 @@ configure_gitlab() {
     fi
     if [ -z "${GITLAB_REGISTRY_PREFIX}" ] && [ "${GITLAB_URL}" = "https://gitlab.com" ]; then
         GITLAB_REGISTRY_PREFIX="registry.gitlab.com/$(echo "${GITLAB_PROJECT_PATH}" | tr '[:upper:]' '[:lower:]')"
+    fi
+}
+
+# Checks the access token against GitLab and reports any scopes the automatic steps need but it lacks.
+# Steps a token can't do fall back to manual instructions, so this only warns.
+check_gitlab_token() {
+    local status scopes missing=()
+    status=$(curl -sS -o "${TEMP_DIR}/token.json" -w '%{http_code}' -H "@${TEMP_DIR}/gitlab-auth-header" \
+        "${GITLAB_URL}/api/v4/personal_access_tokens/self" 2> /dev/null || true)
+    if [ "${status}" = "401" ]; then
+        warn "${GITLAB_URL} rejected the access token (typo, expired, revoked, or a token for another GitLab server)."
+        warn "Continuing without it; the steps it would have done will show manual instructions."
+        GITLAB_TOKEN=""
+        rm -f "${TEMP_DIR}/gitlab-auth-header"
+        return 0
+    fi
+    if [ "${status}" != "200" ]; then
+        warn "Couldn't check the access token's scopes (HTTP ${status:-error}); continuing with it."
+        return 0
+    fi
+
+    scopes=$(jq -r '(.scopes // []) | join(",")' "${TEMP_DIR}/token.json")
+    if [ -z "${scopes}" ]; then
+        warn "This token has no scopes (fine-grained tokens don't). Steps it can't do will fall back to manual."
+        return 0
+    fi
+    for scope in create_runner read_api write_registry; do
+        case ",${scopes}," in
+            *",${scope},"*|*",api,"*) ;;
+            *) missing+=("${scope}") ;;
+        esac
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "The access token is missing the scope(s): ${missing[*]} (it has: ${scopes})."
+        warn "Steps that need them will fall back to manual instructions."
+    else
+        ok "Access token has the scopes needed (${scopes})"
     fi
 }
 
