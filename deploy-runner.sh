@@ -3,6 +3,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+# Disable the AWS CLI v2 pager so commands don't block waiting for input
+export AWS_PAGER=""
+
 if [[ "$#" -ne 4 ]]
 then
     echo "Incorrect number of arguments"
@@ -41,8 +44,6 @@ callCloudFormation()
             ParameterKey=GitlabServerURL,ParameterValue=${GitlabServerURL} \
             ParameterKey=DockerImagePath,ParameterValue=${DockerImagePath} \
             ParameterKey=RunnersToken,ParameterValue=\"${RunnersToken}\" \
-            ParameterKey=RunnerVersion,ParameterValue=${RunnerVersion} \
-            ParameterKey=RunnerEnvironment,ParameterValue=${RunnerEnvironment} \
             ParameterKey=LambdaS3Bucket,ParameterValue=${LambdaS3Bucket} \
             ParameterKey=TimeStamp,ParameterValue=$2 \
             ParameterKey=Concurrent,ParameterValue=${Concurrent} \
@@ -88,8 +89,8 @@ uploadLifecycleHookToS3()
 }
 
 uploadRunnerMonitorToS3() {
-  # Note: Current lambda runtime for nodejs14 only supports aws-sdk 2.888.0,
-  #  this project uses 3.x, so we have to include the aws-sdk in our function
+  # Note: The nodejs lambda runtime ships its own aws-sdk v3, but we bundle ours
+  #  so the deployed function uses the versions pinned in package.json
     
   file_name="${stack_name}-runner-monitor-${time_stamp}.zip"
 

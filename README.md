@@ -106,7 +106,7 @@ Now go to your Gitlab project Settings->CICD->Runners->Available specific runner
 <img src="Images/available-runners-1.png" width="500">
 
 ## Updating the Gitlab Runner
-There are times when you would want to update the Gitlab Runner. For example, updating the instance VolumeSize in order to resolve a disk space issue, or updating the AMI ID when a new AMI becomes available.  
+There are times when you would want to update the Gitlab Runner. For example, updating the instance VolumeSize in order to resolve a disk space issue, or picking up a new AMI. The `ImageId` property is an SSM public parameter name (by default the latest Amazon Linux 2023 AMI), so re-running the deploy script resolves it to the newest AMI.  
 Utilizing the properties file and launch template makes it easy to update the Gitlab Runner. Simply update the Gitlab Runner configuration parameters in the properties file. Then, run the deploy script to udpate the Gitlab Runner stack.
 
 Below is an example of updating the Gitlab Runner instance type.  
@@ -114,7 +114,7 @@ Below is an example of updating the Gitlab Runner instance type.
 ### To update the instance type of the runner instance: 
 1.	Update the “InstanceType” parameter in the properties file. 
 ```
-InstanceType=t2.medium
+InstanceType=t3a.large
 ```
 2.	Run the deploy-runner.sh script to update the CloudFormation stack:
 ```

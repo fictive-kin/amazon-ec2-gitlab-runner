@@ -11,11 +11,12 @@ Parameters:
     Type: "List<AWS::EC2::Subnet::Id>"
     Description: "Use Private App Subnets"
   ImageId:
-    Type: 'AWS::EC2::Image::Id'
-    Description: The image ID to use to create the EC2 runner instance.  
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: SSM parameter name that resolves to the AMI ID used to create the EC2 runner instance. Defaults to the latest Amazon Linux 2023 AMI.
   InstanceType:
     Type: "String"
-    Default: "t3.medium"
+    Default: "t3a.medium"
     Description: "Instance type for EC2 runner instance"
   InstanceName:
     Type: "String"
@@ -27,7 +28,7 @@ Parameters:
     Description: "Volume size"
   VolumeType:
     Type: "String"
-    Default: "gp2"
+    Default: "gp3"
     Description: "Volume Type Attached to instance"
   MaxSize:
     Type: "Number"
@@ -62,17 +63,6 @@ Parameters:
   RunnersToken:
     Type: "String"
     Description: "Comma delimited tokens for the Gitlab projects you want to register to the runner. See runner registration process: https://docs.gitlab.com/runner/register/. "
-  RunnerVersion:
-    Type: "String"
-    Default: "v1"
-    Description: "Version of the Runner"
-  RunnerEnvironment:
-    Type: "String"
-    AllowedValues:
-      - "dev"
-      - "qa"
-      - "prod"
-    Description: "The environment that the runner is in"
   LambdaS3Bucket:
     Type: String
     Default: ""
@@ -101,18 +91,6 @@ Parameters:
     Default: 2
     Description: The number of jobs that we should be able to take before needing to wait on a scaling event.
 
-Mappings: 
-  GitlabRunnerRegisterOptionsMap: 
-    dev:
-      isLOCKED: "false"
-      ACCESS: "not_protected"
-    qa:
-      isLOCKED: "true"
-      ACCESS: "ref_protected"
-    prod:
-      isLOCKED: "true"
-      ACCESS: "ref_protected"
-    
 Resources:
   GitlabRunnerRole:
     Type: 'AWS::IAM::Role'
@@ -225,6 +203,10 @@ Resources:
           Arn: !GetAtt InstanceProfile.Arn
         ImageId: !Ref ImageId
         InstanceType: !Ref InstanceType
+        # IMDSv2 only. Hop limit 2 lets job containers on the docker bridge network reach instance metadata.
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
         SecurityGroupIds:
           - !GetAtt RunnerSecurityGroup.GroupId
         UserData:
@@ -274,7 +256,7 @@ Resources:
             02StartDocker:
               command: sudo service docker start
             03DownloadGitlabRunner:
-              command: sudo wget -O /usr/bin/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-linux-amd64
+              command: sudo curl -fsSL -o /usr/bin/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-linux-amd64
             04ChmodGitlabRunner:
               command: sudo chmod a+x /usr/bin/gitlab-runner
             05AddUser:
@@ -286,20 +268,19 @@ Resources:
             08SetRegion:
               command: !Sub 'aws configure set default.region ${AWS::Region}'
             09ConfigureDockerExecutor:
-              command: !Sub 
-                - |
-                  for GitlabGroupToken in `aws ssm get-parameters --names /${AWS::StackName}/ci-tokens --query 'Parameters[0].Value' | sed -e "s/\"//g" | sed "s/,/ /g"`;do
-                      sudo gitlab-runner register \
-                      --non-interactive \
-                      --url "${GitlabServerURL}" \
-                      --token $GitlabGroupToken \
-                      --executor "docker" \
-                      --docker-image "${DockerImagePath}" \
-                      --description "Gitlab Runner with Docker Executor" \
-                      --docker-volumes "/var/run/docker.sock:/var/run/docker.sock" 
-                  done
-                - isLOCKED: !FindInMap [GitlabRunnerRegisterOptionsMap, !Ref RunnerEnvironment, isLOCKED]
-                  ACCESS: !FindInMap [GitlabRunnerRegisterOptionsMap, !Ref RunnerEnvironment, ACCESS]
+              # Runner settings such as locked, access level and tags are configured in GitLab when the
+              # runner is created; gitlab-runner rejects them when registering with an authentication token.
+              command: !Sub |
+                for GitlabGroupToken in `aws ssm get-parameters --names /${AWS::StackName}/ci-tokens --query 'Parameters[0].Value' | sed -e "s/\"//g" | sed "s/,/ /g"`;do
+                    sudo gitlab-runner register \
+                    --non-interactive \
+                    --url "${GitlabServerURL}" \
+                    --token $GitlabGroupToken \
+                    --executor "docker" \
+                    --docker-image "${DockerImagePath}" \
+                    --description "Gitlab Runner with Docker Executor" \
+                    --docker-volumes "/var/run/docker.sock:/var/run/docker.sock"
+                done
             10StartCfnHup:
               command: systemctl start cfn-hup && systemctl enable cfn-hup
   RunnerAutoScalingGroup:
@@ -393,10 +374,10 @@ Resources:
                     "echo $ASGNAME",
                     "LIFECYCLEHOOKNAME='${LifecycleHook}'",
                     "echo $LIFECYCLEHOOKNAME",
-                    "INSTANCEID=$(curl http://169.254.169.254/latest/meta-data/instance-id)",
+                    "TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")",
+                    "INSTANCEID=$(curl -s -H \"X-aws-ec2-metadata-token: ${!TOKEN}\" http://169.254.169.254/latest/meta-data/instance-id)",
                     "echo $INSTANCEID",
-                    "REGION=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone)",
-                    "REGION=${!REGION::-1}",
+                    "REGION=$(curl -s -H \"X-aws-ec2-metadata-token: ${!TOKEN}\" http://169.254.169.254/latest/meta-data/placement/region)",
                     "echo $REGION",
                     "HOOKRESULT='CONTINUE'",
                     "MESSAGE='Gitlab runner process is running'",
@@ -429,7 +410,7 @@ Resources:
       Handler: gitlab-runner-lifecycle-hook.lambda_handler
       # TODO: This role is likely too permissive
       Role: !GetAtt GitlabRunnerRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
       Environment:
         Variables:
           DOCUMENT_NAME: !Ref Document
@@ -501,7 +482,7 @@ Resources:
         S3Key: !Sub "${AWS::StackName}/${AWS::StackName}-runner-monitor-${TimeStamp}.zip"
       Handler: index.handler
       Role: !GetAtt RunnerMonitorRole.Arn
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Timeout: 900
       MemorySize: 256
       ReservedConcurrentExecutions: 1
