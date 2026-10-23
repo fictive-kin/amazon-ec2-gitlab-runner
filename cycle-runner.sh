@@ -17,18 +17,18 @@ echo "Cycle instances in autoscaling group: "$AutoScalingGroupName
 
 region=$2
 
-if [[ -n "$3" ]]; then
-  profile=$3
-  IGNORE=$(aws sts get-caller-identity --profile "${profile}")
+profile_args=()
+if [[ -n "${3:-}" ]]; then
+  profile_args=(--profile "$3")
+  IGNORE=$(aws sts get-caller-identity --profile "$3")
 else
-  profile="default"
-  echo "No AWS profile was provided, hence using the default profile."
+  echo "No AWS profile was provided, so the AWS CLI's default credentials are used."
 fi
 
 aws autoscaling start-instance-refresh \
   --auto-scaling-group-name="${AutoScalingGroupName}" \
   --region="${region}" \
-  --profile="${profile}"
+  ${profile_args[@]+"${profile_args[@]}"}
 
 echo "Refresh initiated"
 

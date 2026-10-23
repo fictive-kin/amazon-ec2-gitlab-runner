@@ -101,11 +101,11 @@ Once the docker executor image has been pushed to the Gitlab Container Registry,
 3.	Run the deploy script to deploy the runner: 
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> <aws-profile> <stack-name> 
+./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
 
 <properties-file> is the name of the properties file. 
 <region> is the region where you want to deploy the stack. 
-<aws-profile> is the name of the CLI profile you set up in the prerequisites section. 
+<aws-profile> is optional: the name of the CLI profile you set up in the prerequisites section. Leave it out to use the AWS CLI's default credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables, AWS_PROFILE, or the default profile). 
 <stack-name> is the name you chose for the CloudFormation stack. 
 ```
 For example: 
@@ -135,7 +135,7 @@ InstanceType=t3a.large
 2.	Run the deploy-runner.sh script to update the CloudFormation stack:
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> <aws-profile> <stack-name> 
+./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
 ```
 
 ## Terminate the Gitlab Runner
@@ -169,7 +169,7 @@ RunnersToken=glrt-exampletoken1,glrt-exampletoken2
 2.	Update the Gitlab Runner stack. This overwrites the SecureString SSM parameter `/<stack-name>/runner-tokens` that stores the tokens. If RunnersToken is empty, the stored tokens are kept. 
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> <aws-profile> <stack-name> 
+./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
 ```
 3.	Relaunch the instances in the Gitlab Runner autoscaling group. The new instances will use the new RunnersToken value. Run the following command to relaunch the instances:
 ```

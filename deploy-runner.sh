@@ -6,10 +6,11 @@
 # Disable the AWS CLI v2 pager so commands don't block waiting for input
 export AWS_PAGER=""
 
-if [[ "$#" -ne 4 ]]
+if [[ "$#" -lt 3 || "$#" -gt 4 ]]
 then
     echo "Incorrect number of arguments"
-    echo "Usage: $0 <properties-file-path> <region> <aws-profile> <stack-name>"
+    echo "Usage: $0 <properties-file-path> <region> [<aws-profile>] <stack-name>"
+    echo "Without <aws-profile>, the AWS CLI's default credential chain is used (environment variables, AWS_PROFILE, the default profile or an instance role)."
     exit 1
 fi
 
@@ -25,7 +26,7 @@ callCloudFormation()
         --stack-name ${stack_name} \
         --template-body file://gitlab-runner.yaml \
         --capabilities CAPABILITY_NAMED_IAM \
-        --profile ${profile} \
+        ${profile_arg} \
         --region ${region} \
         --parameters \
             ParameterKey=VpcID,ParameterValue=${VpcID} \
@@ -58,7 +59,7 @@ verifyStackSuccess()
     status=$(aws cloudformation describe-stacks \
                                     --stack-name ${stack_name}  \
                                     --query "Stacks[0].StackStatus" \
-                                    --profile ${profile} \
+                                    ${profile_arg} \
                                     --region ${region} \
                                     --output text) \
                                     || errorExit "Error getting stack status" 2> /dev/null
@@ -78,7 +79,7 @@ storeRunnerTokens()
     parameter_name="/${stack_name}/runner-tokens"
 
     if [ -z "${RunnersToken}" ]; then
-        aws ssm get-parameter --name ${parameter_name} --profile ${profile} --region ${region} > /dev/null 2>&1 \
+        aws ssm get-parameter --name ${parameter_name} ${profile_arg} --region ${region} > /dev/null 2>&1 \
             || errorExit "RunnersToken is empty and no tokens are stored in ${parameter_name}"
         echo "Using runner tokens already stored in ${parameter_name}"
         return
@@ -92,7 +93,7 @@ storeRunnerTokens()
     input_file=$(mktemp)
     chmod 600 ${input_file}
     printf '{"Name": "%s", "Type": "SecureString", "Overwrite": true, "Value": "%s"}' "${parameter_name}" "${RunnersToken}" > ${input_file}
-    aws ssm put-parameter --cli-input-json file://${input_file} --profile ${profile} --region ${region} > /dev/null
+    aws ssm put-parameter --cli-input-json file://${input_file} ${profile_arg} --region ${region} > /dev/null
     status=$?
     rm -f ${input_file}
     if [ ${status} -ne 0 ]; then
@@ -113,7 +114,7 @@ uploadLifecycleHookToS3()
   *)        echo "unknown: $OSTYPE" ;;
   esac
   
-  aws s3 cp --profile ${profile} ${file_name} s3://${LambdaS3Bucket}/${stack_name}/${file_name}
+  aws s3 cp ${profile_arg} ${file_name} s3://${LambdaS3Bucket}/${stack_name}/${file_name}
   if [ $? -ne 0 ]; then
       errorExit "Uploading lifecycle-hook lambda function code to S3 did not complete successfully."
   fi
@@ -142,7 +143,7 @@ uploadRunnerMonitorToS3() {
 
   cd ../..
 
-  aws s3 cp --profile ${profile} ${file_name} s3://${LambdaS3Bucket}/${stack_name}/${file_name}
+  aws s3 cp ${profile_arg} ${file_name} s3://${LambdaS3Bucket}/${stack_name}/${file_name}
   if [ $? -ne 0 ]; then
       errorExit "Uploading lifecycle-hook lambda function code to S3 did not complete successfully."
   fi
@@ -152,7 +153,7 @@ uploadRunnerMonitorToS3() {
 deployStack()
 {
     echo -n "Checking if stack already exists..."
-    aws cloudformation describe-stacks --stack-name ${stack_name} --profile ${profile} --region ${region} --no-paginate --query="Stacks[].{Name: StackName}"
+    aws cloudformation describe-stacks --stack-name ${stack_name} ${profile_arg} --region ${region} --no-paginate --query="Stacks[].{Name: StackName}"
 
     if [ $? -ne 0 ]; then
         echo "Stack does not exist, creating it..."
@@ -163,7 +164,7 @@ deployStack()
         fi
 
         echo -n "Waiting for stack creation to complete..."
-        aws cloudformation wait stack-create-complete --stack-name ${stack_name} --profile ${profile} --region ${region} 2> /dev/null
+        aws cloudformation wait stack-create-complete --stack-name ${stack_name} ${profile_arg} --region ${region} 2> /dev/null
         if [ $? -ne 0 ]; then
             echo
             echo -n "Stack creation completed with failure..."
@@ -188,7 +189,7 @@ deployStack()
         fi
 
         echo "Waiting for stack update to complete..."
-        aws cloudformation wait stack-update-complete --stack-name ${stack_name} --profile ${profile} --region ${region} 2> /dev/null
+        aws cloudformation wait stack-update-complete --stack-name ${stack_name} ${profile_arg} --region ${region} 2> /dev/null
         if [ $? -ne 0 ]; then
             echo "Stack update completed with failure..."
         fi
@@ -201,10 +202,16 @@ deployStack()
 source $1 || errorExit "Unable to load properties"
 
 region=$2
-profile=$3
-stack_name=$4
-
-echo "Deploying Gitlab runner in region: "$region", using AWS profile: "$profile
+if [[ "$#" -eq 4 ]]; then
+    profile=$3
+    stack_name=$4
+    profile_arg="--profile ${profile}"
+    echo "Deploying Gitlab runner in region: ${region}, using AWS profile: ${profile}"
+else
+    stack_name=$3
+    profile_arg=""
+    echo "Deploying Gitlab runner in region: ${region}, using the default AWS credentials"
+fi
 echo "CloudFormation stack name: "$stack_name
 
 #Suffix for the lambda zip
