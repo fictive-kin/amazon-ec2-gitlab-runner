@@ -49,7 +49,8 @@ callCloudFormation()
             ParameterKey=Concurrent,ParameterValue=${Concurrent} \
             ParameterKey=CheckInterval,ParameterValue=${CheckInterval} \
             ParameterKey=CostCenter,ParameterValue=${CostCenter} \
-            ParameterKey=AppId,ParameterValue=${AppId}
+            ParameterKey=AppId,ParameterValue=${AppId} \
+            ParameterKey=GitlabRunnerVersion,ParameterValue=${GitlabRunnerVersion:-latest}
 }
 
 verifyStackSuccess()

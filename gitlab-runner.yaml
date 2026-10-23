@@ -90,6 +90,13 @@ Parameters:
     Type: Number
     Default: 2
     Description: The number of jobs that we should be able to take before needing to wait on a scaling event.
+  GitlabRunnerVersion:
+    Type: String
+    Default: "latest"
+    Description: GitLab Runner version to install from the official GitLab package repository (e.g. 18.5.0), or "latest".
+
+Conditions:
+  PinGitlabRunnerVersion: !Not [!Equals [!Ref GitlabRunnerVersion, "latest"]]
 
 Resources:
   GitlabRunnerRole:
@@ -252,19 +259,20 @@ Resources:
                   sudo rm -f /etc/machine-id ;
                   sudo systemd-firstboot --root=/ --setup-machine-id
             01InstallDocker:
-              command: sudo yum -y install docker
+              command: sudo dnf -y install docker
             02StartDocker:
-              command: sudo service docker start
-            03DownloadGitlabRunner:
-              command: sudo curl -fsSL -o /usr/bin/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-linux-amd64
-            04ChmodGitlabRunner:
-              command: sudo chmod a+x /usr/bin/gitlab-runner
-            05AddUser:
-              command: sudo useradd --comment 'GitLab Runner' --create-home gitlab-runner --shell /bin/bash
-            06InstallGitlabRunner:
-              command: sudo gitlab-runner install --user=gitlab-runner --working-directory=/home/gitlab-runner
-            07StartGitlabRunner:
-              command: sudo gitlab-runner start              
+              command: sudo systemctl enable --now docker
+            # https://docs.gitlab.com/runner/install/linux-repository/
+            03AddGitlabRunnerRepository:
+              command: curl -fsSL "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.rpm.sh" | sudo bash
+            # The package creates the gitlab-runner user and installs the systemd service
+            04InstallGitlabRunner:
+              command: !If
+                - PinGitlabRunnerVersion
+                - !Sub "sudo dnf -y install gitlab-runner-${GitlabRunnerVersion} gitlab-runner-helper-images-${GitlabRunnerVersion}"
+                - "sudo dnf -y install gitlab-runner"
+            05StartGitlabRunner:
+              command: sudo systemctl daemon-reload && sudo systemctl enable --now gitlab-runner
             08SetRegion:
               command: !Sub 'aws configure set default.region ${AWS::Region}'
             09ConfigureDockerExecutor:
