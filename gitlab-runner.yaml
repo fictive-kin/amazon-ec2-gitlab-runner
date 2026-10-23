@@ -60,9 +60,6 @@ Parameters:
   DockerImagePath:
     Type: String
     Description: Docker path of the GitLab Runner Docker image    
-  RunnersToken:
-    Type: "String"
-    Description: "Comma delimited tokens for the Gitlab projects you want to register to the runner. See runner registration process: https://docs.gitlab.com/runner/register/. "
   LambdaS3Bucket:
     Type: String
     Default: ""
@@ -139,7 +136,8 @@ Resources:
             Effect: Allow
           - Sid: AllowSSMParameterStoreRead
             Action: 'ssm:GetParameter*'
-            Resource: !Sub 'arn:aws:ssm:*:*:parameter/${AWS::StackName}/ci-tokens'
+            # SecureString written by deploy-runner.sh; CloudFormation cannot create SecureString parameters
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/runner-tokens'
             Effect: Allow
           - Sid: AllowSSMDocumentRead
             Action:
@@ -168,13 +166,6 @@ Resources:
       ManagedPolicyName: !Sub ${AWS::StackName}-policy
       Roles:
         - !Ref GitlabRunnerRole
-
-  RunnerTokenParameter:
-    Type: "AWS::SSM::Parameter"
-    Properties:
-      Name: !Sub "/${AWS::StackName}/ci-tokens"
-      Type: "String"
-      Value: !Ref RunnersToken
 
   RunnerSecurityGroup:
     Type: "AWS::EC2::SecurityGroup"
@@ -307,7 +298,7 @@ Resources:
               # Runner settings such as locked, access level and tags are configured in GitLab when the
               # runner is created; gitlab-runner rejects them when registering with an authentication token.
               command: !Sub |
-                for GitlabGroupToken in `aws ssm get-parameters --names /${AWS::StackName}/ci-tokens --query 'Parameters[0].Value' | sed -e "s/\"//g" | sed "s/,/ /g"`;do
+                for GitlabGroupToken in $(aws ssm get-parameter --name /${AWS::StackName}/runner-tokens --with-decryption --query Parameter.Value --output text | tr ',' ' ');do
                     sudo gitlab-runner register \
                     --non-interactive \
                     --url "${GitlabServerURL}" \
@@ -326,12 +317,12 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Count: !Ref DesiredCapacity
-        Timeout: PT5M
+        Timeout: PT15M
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MinInstancesInService: !Ref MinInstancesInService
         MaxBatchSize: !Ref MaxBatchSize
-        PauseTime: "PT5M"
+        PauseTime: "PT15M"
         WaitOnResourceSignals: true
         SuspendProcesses:
           - HealthCheck

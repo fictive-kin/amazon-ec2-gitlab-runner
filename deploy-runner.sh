@@ -43,7 +43,6 @@ callCloudFormation()
             ParameterKey=MaxInstanceLifetime,ParameterValue=${MaxInstanceLifetime} \
             ParameterKey=GitlabServerURL,ParameterValue=${GitlabServerURL} \
             ParameterKey=DockerImagePath,ParameterValue=${DockerImagePath} \
-            ParameterKey=RunnersToken,ParameterValue=\"${RunnersToken}\" \
             ParameterKey=LambdaS3Bucket,ParameterValue=${LambdaS3Bucket} \
             ParameterKey=TimeStamp,ParameterValue=$2 \
             ParameterKey=Concurrent,ParameterValue=${Concurrent} \
@@ -69,6 +68,37 @@ verifyStackSuccess()
     else
         errorExit "Stack $2 failed (status ${status}). See CloudFormation console for error details"
     fi
+}
+
+# Runner tokens are stored as a SecureString, which CloudFormation cannot create, so they
+# are written here rather than passed to the stack. Leave RunnersToken empty in the
+# properties file to keep the tokens already stored for the stack.
+storeRunnerTokens()
+{
+    parameter_name="/${stack_name}/runner-tokens"
+
+    if [ -z "${RunnersToken}" ]; then
+        aws ssm get-parameter --name ${parameter_name} --profile ${profile} --region ${region} > /dev/null 2>&1 \
+            || errorExit "RunnersToken is empty and no tokens are stored in ${parameter_name}"
+        echo "Using runner tokens already stored in ${parameter_name}"
+        return
+    fi
+
+    if ! [[ "${RunnersToken}" =~ ^[A-Za-z0-9_.,-]+$ ]]; then
+        errorExit "RunnersToken must be a comma separated list of runner authentication tokens"
+    fi
+
+    # Pass the tokens in a file so they don't appear in the process list
+    input_file=$(mktemp)
+    chmod 600 ${input_file}
+    printf '{"Name": "%s", "Type": "SecureString", "Overwrite": true, "Value": "%s"}' "${parameter_name}" "${RunnersToken}" > ${input_file}
+    aws ssm put-parameter --cli-input-json file://${input_file} --profile ${profile} --region ${region} > /dev/null
+    status=$?
+    rm -f ${input_file}
+    if [ ${status} -ne 0 ]; then
+        errorExit "Storing runner tokens in ${parameter_name} did not complete successfully."
+    fi
+    echo "Stored runner tokens in ${parameter_name}"
 }
 
 uploadLifecycleHookToS3()
@@ -180,6 +210,7 @@ echo "CloudFormation stack name: "$stack_name
 #Suffix for the lambda zip
 time_stamp=`date "+%Y%m%d%H%M%S"` 
 
+storeRunnerTokens
 uploadLifecycleHookToS3
 uploadRunnerMonitorToS3
 deployStack
