@@ -121,11 +121,9 @@ Resources:
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy'
         - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
-      RoleName: GitlabRunnerRole
   InstanceProfile:
     Type: 'AWS::IAM::InstanceProfile'
     Properties:
-      InstanceProfileName: GitlabRunnerRole
       Path: /
       Roles:
         - !Ref GitlabRunnerRole
