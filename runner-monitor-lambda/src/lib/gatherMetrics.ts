@@ -8,9 +8,15 @@ import {getAutoscalingGroupInfo} from "./asgInfo";
 // Instances publish every 30 seconds; allow a few missed publishes before treating one as unhealthy
 const maximumMetricAgeSeconds = 180
 
-interface InstanceMetrics {
+// How far back to look for an instance's latest job count. An instance with nothing in this
+// window has not published yet (still booting), as opposed to one that published and stopped.
+export const metricLookbackSeconds = 3 * 60 * 60
+
+export interface InstanceMetrics {
     instanceId: string
     jobCount: number
+    // age of the latest job count, or null when none was published in the lookback window
+    metricAgeSeconds: number | null
     error : string | null
 }
 
@@ -20,6 +26,7 @@ export interface ClusterMetrics {
     currentInstances: number
     activeInstances: number
     currentJobCount: number
+    inServiceInstanceIds: string[]
     instances : InstanceMetrics[],
 }
 
@@ -33,6 +40,7 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
             activeInstances: 0,
             minInstances: asgInfo.minSize,
             maxInstances: asgInfo.maxSize,
+            inServiceInstanceIds: [],
             instances: [],
         }
     }
@@ -60,6 +68,7 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
         activeInstances: activeInstanceCount,
         minInstances: asgInfo.minSize,
         maxInstances: asgInfo.maxSize,
+        inServiceInstanceIds: asgInfo.inServiceInstanceIds,
         instances: metrics,
     }
 }
@@ -74,7 +83,7 @@ const getInstanceMetrics = async (autoScalingGroupName: string, instanceIds: str
 
     const now = new Date()
     const command = new cw.GetMetricDataCommand({
-        StartTime: new Date(now.getTime() - 5 * 60 * 1000),
+        StartTime: new Date(now.getTime() - metricLookbackSeconds * 1000),
         EndTime: now,
         ScanBy: cw.ScanBy.TIMESTAMP_DESCENDING,
         MetricDataQueries: instanceIds.map((instanceId, index): cw.MetricDataQuery => {
@@ -106,17 +115,17 @@ const getInstanceMetrics = async (autoScalingGroupName: string, instanceIds: str
 
         if (latestTimestamp == null || latestValue == null) {
             console.log(`No job count metric found for instance ${instanceId}`)
-            return {instanceId, jobCount: 0, error: "no job count metric found"}
+            return {instanceId, jobCount: 0, metricAgeSeconds: null, error: "no job count metric found"}
         }
 
         const ageSeconds = (now.getTime() - latestTimestamp.getTime()) / 1000
         if (ageSeconds > maximumMetricAgeSeconds) {
             console.log(`Job count metric for instance ${instanceId} is stale (${ageSeconds}s old)`)
-            return {instanceId, jobCount: 0, error: "job count metric is stale"}
+            return {instanceId, jobCount: 0, metricAgeSeconds: ageSeconds, error: "job count metric is stale"}
         }
 
         console.log(`For instance: ${instanceId} Build Count is ${latestValue}`)
-        return {instanceId, jobCount: latestValue, error: null}
+        return {instanceId, jobCount: latestValue, metricAgeSeconds: ageSeconds, error: null}
     })
 }
 

@@ -6,6 +6,8 @@ export interface AutoScalingGroupInfo {
     minSize: number
     currentCapacity: number
     instanceIds: string[]
+    // instances past launch, the only ones that can be marked unhealthy
+    inServiceInstanceIds: string[]
 }
 
 export const getAutoscalingGroupInfo = async (autoScalingGroupName : string): Promise<AutoScalingGroupInfo> => {
@@ -48,10 +50,15 @@ export const getAutoscalingGroupInfo = async (autoScalingGroupName : string): Pr
     })
 
     const activeInstanceIds = activeInstances.map((i) => i.InstanceId || "").filter(i => i != "")
+    const inServiceInstanceIds = activeInstances
+        .filter(i => i.LifecycleState == asg.LifecycleState.IN_SERVICE)
+        .map((i) => i.InstanceId || "")
+        .filter(i => i != "")
 
     return {
         autoScalingGroupName: autoScalingGroupName,
         instanceIds: activeInstanceIds,
+        inServiceInstanceIds: inServiceInstanceIds,
         maxSize: group.MaxSize,
         minSize: group.MinSize,
         currentCapacity: group.DesiredCapacity,

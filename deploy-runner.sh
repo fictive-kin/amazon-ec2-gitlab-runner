@@ -79,7 +79,11 @@ callCloudFormation()
             ParameterKey=CostCenter,ParameterValue=${CostCenter} \
             ParameterKey=AppId,ParameterValue=${AppId} \
             ParameterKey=GitlabRunnerVersion,ParameterValue=${GitlabRunnerVersion:-latest} \
-            ParameterKey=AssociatePublicIpAddress,ParameterValue=${AssociatePublicIpAddress:-false}
+            ParameterKey=AssociatePublicIpAddress,ParameterValue=${AssociatePublicIpAddress:-false} \
+            ParameterKey=SwapSize,ParameterValue=${SwapSize:-4} \
+            ParameterKey=JobMemoryLimit,ParameterValue=${JobMemoryLimit:-1536m} \
+            ParameterKey=ServiceMemoryLimit,ParameterValue=${ServiceMemoryLimit:-512m} \
+            ParameterKey=DockerPullPolicy,ParameterValue=\"${DockerPullPolicy:-if-not-present,always}\"
 }
 
 verifyStackSuccess()

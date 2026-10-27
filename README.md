@@ -32,7 +32,7 @@ Run the interactive setup script from the root of this repository:
 ```
 It checks your local tools and AWS credentials, and infers the GitLab project and stack name from the git remote. Then it:
 - creates the GitLab runner (with a fine-grained personal access token that has Project: Read and Runner: Create) or tells you how to create it and asks for the token;
-- builds and pushes the executor image for linux/amd64, logging in with a project deploy token that has the write_registry scope (fine-grained tokens can't push images);
+- builds and pushes the executor image for linux/amd64, logging in with a project deploy token that has the write_registry scope (fine-grained tokens can't push images). Each build is tagged with the git commit (plus a timestamp if there are uncommitted changes) as well as `:latest`, and the properties file points at the commit tag. Runners use the pull policy `if-not-present,always` (`DockerPullPolicy`), which reuses an image already on the instance whenever its tag matches, so a new tag is how a new image reaches the runners;
 - lets you pick a VPC and subnets (public or private with NAT);
 - creates the Lambda S3 bucket if needed;
 - writes `<stack-name>.properties` and runs `deploy-runner.sh`.
@@ -137,6 +137,20 @@ InstanceType=t3a.large
 cd <your-repo-dir>
 ./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
 ```
+
+## Collecting diagnostics
+When the runner stops picking up jobs, collect its logs and state with:
+```
+./collect-runner-diagnostics.sh <stack-name> <region> [<aws-profile>] [--hours <n>]
+```
+It writes `diagnostics/<stack-name>-<timestamp>/` and a `.tar.gz` of it, with the stack, autoscaling group, Lambda logs and metrics from AWS, and from each instance (through SSM Run Command) the gitlab-runner journal, redacted `config.toml`, `gitlab-runner verify`, a goroutine dump, docker state, memory, disk and OOM kills. Set `GITLAB_TOKEN` to also fetch the runners' status and recent jobs from GitLab. Tokens are redacted.
+
+## Watching running jobs
+To watch the stack live from your machine:
+```
+GITLAB_TOKEN=<token> ./watch-runner-jobs.sh <stack-name> <region> [<aws-profile>] [--interval <seconds>] [--runner-id <id>]
+```
+It refreshes the autoscaling group's capacity and each instance's state, health and running job count from CloudWatch (an instance whose count stops updating is shown as stale). With `GITLAB_TOKEN` set to a token that can read the runner, it also lists the jobs running right now, with the project, stage, how long each has run and which instance runs it. Without `--runner-id`, the runner ID is read once from an instance through SSM. `--once` prints the view a single time.
 
 ## Terminate the Gitlab Runner
 There are times when an autoscaling group instance must be terminated. For example, during an autoscaling scale-in event, or when the instance is being replaced by a new instance during a stack update, as seen previously. When terminating an instance, you must ensure that the Gitlab Runner finishes executing any running jobs before the instance is terminated, otherwise your environment could be left in an inconsistent state. Also, we want to ensure that the terminated Gitlab Runner is removed from the Gitlab project. We utilize an autoscaling lifecycle hook to achieve these goals.  

@@ -426,14 +426,43 @@ check_registry_push() {
     return 1
 }
 
+# image_repository <image>  -> the image without its tag (a registry port is not a tag)
+image_repository() {
+    local last=${1##*/}
+    if [[ "${last}" == *:* ]]; then
+        echo "${1%:*}"
+    else
+        echo "$1"
+    fi
+}
+
+# Tag for a build of the working tree: the git commit, plus a timestamp when there are
+# uncommitted changes, so every different build gets a different tag
+image_version_tag() {
+    local tag
+    tag=$(git rev-parse --short=12 HEAD 2> /dev/null) || tag="build"
+    if [ -n "$(git status --porcelain 2> /dev/null)" ]; then
+        tag="${tag}-dirty-$(date -u +%Y%m%d%H%M%S)"
+    fi
+    echo "${tag}"
+}
+
 configure_executor_image() {
     step "Executor image (the Docker image CI jobs run in)"
     local default_image=""
-    [ -n "${GITLAB_REGISTRY_PREFIX}" ] && default_image="${GITLAB_REGISTRY_PREFIX}/gitlab-runner:latest"
-    ask DOCKER_IMAGE_PATH "Image path" "${DOCKER_IMAGE_PATH:-${default_image}}"
+    [ -n "${GITLAB_REGISTRY_PREFIX}" ] && default_image="${GITLAB_REGISTRY_PREFIX}/gitlab-runner"
+    [ -n "${DOCKER_IMAGE_PATH}" ] && default_image=$(image_repository "${DOCKER_IMAGE_PATH}")
+    info "Runners reuse an image already on the instance when its tag matches (pull policy"
+    info "if-not-present), so each build is pushed with its own tag, the git commit, as well as :latest."
+    ask DOCKER_IMAGE_PATH "Image path (without a tag to build, or with the tag of an existing image)" "${default_image}"
     [ -n "${DOCKER_IMAGE_PATH}" ] || die "An executor image path is required."
 
-    if ! confirm "Build the Dockerfile in this directory and push it to ${DOCKER_IMAGE_PATH} now?" y; then
+    if ! confirm "Build the Dockerfile in this directory and push it to $(image_repository "${DOCKER_IMAGE_PATH}") now?" y; then
+        if [ "$(image_repository "${DOCKER_IMAGE_PATH}")" = "${DOCKER_IMAGE_PATH}" ]; then
+            DOCKER_IMAGE_PATH="${DOCKER_IMAGE_PATH}:latest"
+            warn "No tag given, so ${DOCKER_IMAGE_PATH} is used. Instances that already have it won't pick"
+            warn "up a new push to :latest until they are replaced; push a new tag to roll out a change."
+        fi
         info "Skipping the build; ${DOCKER_IMAGE_PATH} must already exist and be built for linux/amd64."
         return 0
     fi
@@ -468,15 +497,28 @@ configure_executor_image() {
         docker login "${registry}" || warn "docker login did not succeed; the push below will fail if you are not logged in."
     fi
 
+    local repository
+    repository=$(image_repository "${DOCKER_IMAGE_PATH}")
+    DOCKER_IMAGE_PATH="${repository}:$(image_version_tag)"
+
     # The runners are x86 (t3a); build for amd64 even on Apple Silicon
-    if ! docker buildx build --platform linux/amd64 -t "${DOCKER_IMAGE_PATH}" --push .; then
+    if ! docker buildx build --platform linux/amd64 -t "${DOCKER_IMAGE_PATH}" -t "${repository}:latest" --push .; then
         warn "If the error above says 'insufficient_scope' or 'push access denied', the docker credentials"
         warn "for ${registry} can't push to ${DOCKER_IMAGE_PATH%%:*}. Re-run and log in with a deploy"
         warn "token from that project that has the write_registry scope, and check the project's container"
         warn "registry is enabled (Settings > General > Visibility, project features, permissions)."
         die "Building or pushing ${DOCKER_IMAGE_PATH} failed."
     fi
-    ok "Pushed ${DOCKER_IMAGE_PATH}"
+    ok "Pushed ${DOCKER_IMAGE_PATH} (also tagged :latest)"
+}
+
+# Points an existing properties file at the image just built; deploying it replaces the instances
+update_properties_image() {
+    local updated="${TEMP_DIR}/properties"
+    grep -v '^DockerImagePath=' "${PROPERTIES_FILE}" > "${updated}"
+    echo "DockerImagePath=\"${DOCKER_IMAGE_PATH}\"" >> "${updated}"
+    cat "${updated}" > "${PROPERTIES_FILE}"
+    ok "Set DockerImagePath in ${PROPERTIES_FILE} to ${DOCKER_IMAGE_PATH}"
 }
 
 configure_network() {
@@ -622,6 +664,10 @@ GitlabRunnerVersion=${RUNNER_VERSION}
 LambdaS3Bucket=${LAMBDA_BUCKET}
 Concurrent=${CONCURRENT}
 CheckInterval=3
+SwapSize=4
+JobMemoryLimit=1536m
+ServiceMemoryLimit=512m
+DockerPullPolicy=if-not-present,always
 CostCenter=${COST_CENTER}
 AppId=${APP_ID}
 EOF
@@ -690,8 +736,9 @@ main() {
     if [ "${reuse}" = true ]; then
         load_existing_properties
         LAMBDA_BUCKET=${LambdaS3Bucket}
-        if confirm "Rebuild and push the executor image ${DOCKER_IMAGE_PATH}?" n; then
+        if confirm "Rebuild and push the executor image (currently ${DOCKER_IMAGE_PATH})?" n; then
             configure_executor_image
+            update_properties_image
         fi
     else
         configure_executor_image

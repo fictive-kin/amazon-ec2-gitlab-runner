@@ -98,6 +98,26 @@ Parameters:
     Type: String
     Default: "latest"
     Description: GitLab Runner version to install from the official GitLab package repository (e.g. 18.5.0), or "latest".
+  SwapSize:
+    Type: Number
+    Default: 4
+    MinValue: 0
+    Description: Size in GiB of a swap file on the root volume, so a memory spike slows the instance instead of hanging it. 0 disables swap.
+  JobMemoryLimit:
+    Type: String
+    Default: "1536m"
+    AllowedPattern: "^[0-9]+[bkmg]?$"
+    Description: Memory limit for each job's build container (docker --memory, e.g. 1536m or 2g). Containers started through the mounted docker socket are not limited.
+  ServiceMemoryLimit:
+    Type: String
+    Default: "512m"
+    AllowedPattern: "^[0-9]+[bkmg]?$"
+    Description: Memory limit for each service container of a job (docker --memory, e.g. 512m).
+  DockerPullPolicy:
+    Type: String
+    Default: "if-not-present,always"
+    AllowedPattern: "^(always|if-not-present|never)(,(always|if-not-present|never))*$"
+    Description: Comma separated image pull policies, tried in order until one succeeds. if-not-present reuses an image already on the instance by tag without checking the registry, so give each image build its own tag (setup-runner.sh tags builds with the git commit).
 
 Conditions:
   PinGitlabRunnerVersion: !Not [!Equals [!Ref GitlabRunnerVersion, "latest"]]
@@ -276,7 +296,8 @@ Resources:
             00SetNewMachineID:
               command: |
                   sudo rm -f /etc/machine-id ;
-                  sudo systemd-firstboot --root=/ --setup-machine-id
+                  sudo systemd-firstboot --root=/ --setup-machine-id ;
+                  sudo systemctl restart systemd-journald
             01InstallDocker:
               command: sudo dnf -y install docker
             02StartDocker:
@@ -292,6 +313,18 @@ Resources:
                 - "sudo dnf -y install gitlab-runner"
             05StartGitlabRunner:
               command: sudo systemctl daemon-reload && sudo systemctl enable --now gitlab-runner
+            06CreateSwap:
+              # Low swappiness keeps swap as a safety net rather than something used routinely
+              command: !Sub |
+                if [ "${SwapSize}" -gt 0 ] && [ ! -f /swapfile ]; then
+                    dd if=/dev/zero of=/swapfile bs=1M count=$((${SwapSize} * 1024)) status=none
+                    chmod 600 /swapfile
+                    mkswap /swapfile
+                    swapon /swapfile
+                    echo '/swapfile none swap defaults 0 0' >> /etc/fstab
+                    echo 'vm.swappiness = 10' > /etc/sysctl.d/90-swappiness.conf
+                    sysctl -p /etc/sysctl.d/90-swappiness.conf
+                fi
             08SetRegion:
               command: !Sub 'aws configure set default.region ${AWS::Region}'
             09ConfigureDockerExecutor:
@@ -305,6 +338,9 @@ Resources:
                     --token $GitlabGroupToken \
                     --executor "docker" \
                     --docker-image "${DockerImagePath}" \
+                    --docker-memory "${JobMemoryLimit}" \
+                    --docker-service-memory "${ServiceMemoryLimit}" \
+                    $(echo "${DockerPullPolicy}" | tr ',' '\n' | sed 's/^/--docker-pull-policy /' | tr '\n' ' ') \
                     --description "Gitlab Runner with Docker Executor" \
                     --docker-volumes "/var/run/docker.sock:/var/run/docker.sock"
                 done
@@ -440,6 +476,9 @@ Resources:
       # TODO: This role is likely too permissive
       Role: !GetAtt GitlabRunnerRole.Arn
       Runtime: python3.13
+      # Polls the graceful shutdown command until it starts; the 3 second default cut that short,
+      # so the lifecycle hook was never completed and termination waited out the heartbeat timeout
+      Timeout: 300
       Environment:
         Variables:
           DOCUMENT_NAME: !Ref Document
@@ -494,6 +533,7 @@ Resources:
                 Action:
                   - "autoscaling:DescribeAutoScalingGroups"
                   - "autoscaling:SetDesiredCapacity"
+                  - "autoscaling:SetInstanceHealth"
                   - "cloudwatch:GetMetricData"
                   - "cloudwatch:PutMetricData"
                 Resource:

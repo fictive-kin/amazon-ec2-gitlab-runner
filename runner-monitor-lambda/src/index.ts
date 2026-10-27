@@ -21,6 +21,7 @@ import * as lambda from "aws-lambda";
 import {ClusterMetrics, gatherClusterMetrics} from "./lib/gatherMetrics";
 import {publishMetrics} from "./lib/publishMetrics";
 import {adjustScaling} from "./lib/adjustScaling";
+import {replaceUnresponsiveInstance} from "./lib/replaceUnresponsive";
 
 export const handler = async (event : lambda.ScheduledEvent, context : lambda.Context | null) : Promise<void> => {
     const autoScalingGroupName = config.autoScalingGroupName()
@@ -37,6 +38,9 @@ export const handler = async (event : lambda.ScheduledEvent, context : lambda.Co
 
     console.log(`Adjusting autoscaling`)
     await adjustScaling(autoScalingGroupName, metrics, desiredCapacity)
+
+    console.log(`Checking for unresponsive instances`)
+    await replaceUnresponsiveInstance(autoScalingGroupName, metrics)
 
     console.log(`Done`)
 }
