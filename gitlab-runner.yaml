@@ -118,6 +118,11 @@ Parameters:
     Default: "if-not-present,always"
     AllowedPattern: "^(always|if-not-present|never)(,(always|if-not-present|never))*$"
     Description: Comma separated image pull policies, tried in order until one succeeds. if-not-present reuses an image already on the instance by tag without checking the registry, so give each image build its own tag (setup-runner.sh tags builds with the git commit).
+  CacheExpirationDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    Description: Days after which job cache archives (the cache keyword in .gitlab-ci.yml) are deleted from the shared S3 cache bucket. GitLab rewrites a cache archive each time a job saves it, so a cache still in use is kept.
 
 Conditions:
   PinGitlabRunnerVersion: !Not [!Equals [!Ref GitlabRunnerVersion, "latest"]]
@@ -182,10 +187,46 @@ Resources:
           - Sid: AllowCompleteLifycycle
             Action: 'autoscaling:CompleteLifecycleAction'
             Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-asg'
-            Effect: Allow              
+            Effect: Allow
+          # The runner signs cache URLs with the instance role; job containers never get the credentials
+          - Sid: AllowCacheBucketList
+            Action: 's3:ListBucket'
+            Resource: !GetAtt RunnerCacheBucket.Arn
+            Effect: Allow
+          - Sid: AllowCacheObjects
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${RunnerCacheBucket.Arn}/*'
+            Effect: Allow
       ManagedPolicyName: !Sub ${AWS::StackName}-policy
       Roles:
         - !Ref GitlabRunnerRole
+
+  # Shared job cache, so a cache saved on one instance is found on the others and outlives
+  # instance replacement. Retained on stack deletion; empty and delete it by hand.
+  RunnerCacheBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireCache
+            Status: Enabled
+            ExpirationInDays: !Ref CacheExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
 
   RunnerSecurityGroup:
     Type: "AWS::EC2::SecurityGroup"
@@ -213,6 +254,10 @@ Resources:
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 2
+        # Hostname is the instance ID (i-....ec2.internal), so each job log's "Running on ... via"
+        # line and the instance's logs name the instance
+        PrivateDnsNameOptions:
+          HostnameType: resource-name
         NetworkInterfaces:
           - DeviceIndex: 0
             AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
@@ -221,35 +266,30 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash -xe
+            # The setup in Metadata runs once, at launch; changing Metadata alone doesn't create a new
+            # launch template version, so instances wouldn't be replaced. The settings it uses are listed
+            # here so that changing one replaces the instances. Bump SetupRevision after editing Metadata.
+            # SetupRevision=2 Concurrent=${Concurrent} CheckInterval=${CheckInterval} GitlabServerURL=${GitlabServerURL}
+            # DockerImagePath=${DockerImagePath} DockerPullPolicy=${DockerPullPolicy} GitlabRunnerVersion=${GitlabRunnerVersion}
+            # JobMemoryLimit=${JobMemoryLimit} ServiceMemoryLimit=${ServiceMemoryLimit} SwapSize=${SwapSize}
             yum update -y aws-cfn-bootstrap
             /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource RunnerLaunchTemplate --region ${AWS::Region}
             /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource RunnerAutoScalingGroup --region ${AWS::Region}
+    # Runs once at launch; there is no cfn-hup, because re-running these commands on a running
+    # instance re-registers the runner and resets the machine ID. Changes roll out by replacing
+    # instances instead (see UserData).
     Metadata:
       'AWS::CloudFormation::Init':
         config:
           files:
-            /etc/cfn/cfn-hup.conf:
-              owner: 'root'
-              group: 'root'
-              mode: '000400'
-              content: !Sub |
-                [main]
-                stack=${AWS::StackId}
-                region=${AWS::Region}
-            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
-              content: !Sub |
-                [cfn-auto-reloader-hook]
-                triggers=post.update
-                path=Resources.RunnerLaunchTemplate.Metadata.AWS::CloudFormation::Init
-                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource RunnerLaunchTemplate
-                runas=root
             /etc/gitlab-runner/config.toml:
               content: !Sub |
                 concurrent = ${Concurrent}
                 check_interval = ${CheckInterval}
                 listen_address = "127.0.0.1:9252"
                 log_format = "json"
-            # Publishes this instance's running job count for the runner monitor Lambda to scale on
+            # Publishes this instance's running job count for the runner monitor Lambda to scale on,
+            # and its CPU, memory, swap and memory pressure for watch-runner-jobs.sh
             /usr/local/bin/publish-runner-metrics:
               mode: '000755'
               content: !Sub |
@@ -258,13 +298,34 @@ Resources:
                 TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
                 INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
                 JOB_COUNT=$(curl -sf http://127.0.0.1:9252/metrics | awk 'index($0, "gitlab_runner_jobs{") == 1 { sum += $NF } END { print sum + 0 }')
+                # CPU busy % since the previous run, from the /proc/stat counters saved then
+                read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+                CPU_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+                CPU_IDLE=$((idle + iowait))
+                CPU=""
+                if [ -f /run/publish-runner-metrics.cpu ]; then
+                  read -r PREV_TOTAL PREV_IDLE < /run/publish-runner-metrics.cpu
+                  if [ $((CPU_TOTAL - PREV_TOTAL)) -gt 0 ]; then
+                    CPU=$((100 * (CPU_TOTAL - PREV_TOTAL - CPU_IDLE + PREV_IDLE) / (CPU_TOTAL - PREV_TOTAL)))
+                  fi
+                fi
+                echo "${!CPU_TOTAL} ${!CPU_IDLE}" > /run/publish-runner-metrics.cpu
+                MEMORY=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f", (t - a) * 100 / t }' /proc/meminfo)
+                SWAP=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { printf "%.1f", t ? (t - f) * 100 / t : 0 }' /proc/meminfo)
+                # % of the last 10s in which every task was stalled waiting for memory (thrashing)
+                PRESSURE=$(awk '/^full/ { sub("avg10=", "", $2); print $2 }' /proc/pressure/memory 2> /dev/null || echo 0)
+                DIMENSIONS='[{"Name": "AutoScalingGroupName", "Value": "${AWS::StackName}-asg"}, {"Name": "InstanceId", "Value": "'"${!INSTANCE_ID}"'"}]'
+                metric() {
+                  printf '{"MetricName": "${AWS::StackName}-instance-%s", "Dimensions": %s, "Unit": "%s", "Value": %s}' "$1" "${!DIMENSIONS}" "$2" "$3"
+                }
+                DATA="$(metric job-count Count "${!JOB_COUNT}"), $(metric memory Percent "${!MEMORY}"), $(metric swap Percent "${!SWAP}"), $(metric memory-pressure Percent "${!PRESSURE:-0}")"
+                if [ -n "${!CPU}" ]; then
+                  DATA="${!DATA}, $(metric cpu Percent "${!CPU}")"
+                fi
                 aws cloudwatch put-metric-data \
                   --region ${AWS::Region} \
                   --namespace "${AWS::StackName}-runner-metrics" \
-                  --metric-name "${AWS::StackName}-instance-job-count" \
-                  --dimensions "AutoScalingGroupName=${AWS::StackName}-asg,InstanceId=${!INSTANCE_ID}" \
-                  --unit Count \
-                  --value "${!JOB_COUNT}"
+                  --metric-data "[${!DATA}]"
             /etc/systemd/system/publish-runner-metrics.service:
               content: |
                 [Unit]
@@ -330,24 +391,40 @@ Resources:
             09ConfigureDockerExecutor:
               # Runner settings such as locked, access level and tags are configured in GitLab when the
               # runner is created; gitlab-runner rejects them when registering with an authentication token.
+              # The pull policy list goes through a template config: repeating --docker-pull-policy
+              # keeps only the last value. request_concurrency lets the runner ask GitLab for up to
+              # Concurrent jobs at once; with the default of 1, long polling delays picking up jobs.
+              # The cache is shared by all instances through S3, using the instance role.
               command: !Sub |
+                cat > /etc/gitlab-runner/register-template.toml <<EOF
+                [[runners]]
+                  request_concurrency = ${Concurrent}
+                  [runners.docker]
+                    pull_policy = [$(echo "${DockerPullPolicy}" | sed 's/[^,]*/"&"/g; s/,/, /g')]
+                  [runners.cache]
+                    Type = "s3"
+                    Shared = true
+                    [runners.cache.s3]
+                      ServerAddress = "s3.amazonaws.com"
+                      AuthenticationType = "iam"
+                      BucketName = "${RunnerCacheBucket}"
+                      BucketLocation = "${AWS::Region}"
+                EOF
                 for GitlabGroupToken in $(aws ssm get-parameter --name /${AWS::StackName}/runner-tokens --with-decryption --query Parameter.Value --output text | tr ',' ' ');do
                     sudo gitlab-runner register \
                     --non-interactive \
+                    --template-config /etc/gitlab-runner/register-template.toml \
                     --url "${GitlabServerURL}" \
                     --token $GitlabGroupToken \
                     --executor "docker" \
                     --docker-image "${DockerImagePath}" \
                     --docker-memory "${JobMemoryLimit}" \
                     --docker-service-memory "${ServiceMemoryLimit}" \
-                    $(echo "${DockerPullPolicy}" | tr ',' '\n' | sed 's/^/--docker-pull-policy /' | tr '\n' ' ') \
                     --description "Gitlab Runner with Docker Executor" \
                     --docker-volumes "/var/run/docker.sock:/var/run/docker.sock"
                 done
             10StartPublishRunnerMetrics:
               command: systemctl daemon-reload && systemctl enable --now publish-runner-metrics.timer
-            11StartCfnHup:
-              command: systemctl start cfn-hup && systemctl enable cfn-hup
   RunnerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     CreationPolicy:
@@ -592,3 +669,6 @@ Outputs:
   RunnerInstanceID:
     Description: "AutoScalingGroup Name of the GITLAB CI Runner is: "
     Value: !Ref "RunnerAutoScalingGroup"
+  RunnerCacheBucket:
+    Description: S3 bucket holding the shared job cache
+    Value: !Ref RunnerCacheBucket

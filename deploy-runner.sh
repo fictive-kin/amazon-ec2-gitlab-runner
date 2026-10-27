@@ -83,7 +83,8 @@ callCloudFormation()
             ParameterKey=SwapSize,ParameterValue=${SwapSize:-4} \
             ParameterKey=JobMemoryLimit,ParameterValue=${JobMemoryLimit:-1536m} \
             ParameterKey=ServiceMemoryLimit,ParameterValue=${ServiceMemoryLimit:-512m} \
-            ParameterKey=DockerPullPolicy,ParameterValue=\"${DockerPullPolicy:-if-not-present,always}\"
+            ParameterKey=DockerPullPolicy,ParameterValue=\"${DockerPullPolicy:-if-not-present,always}\" \
+            ParameterKey=CacheExpirationDays,ParameterValue=${CacheExpirationDays:-14}
 }
 
 verifyStackSuccess()

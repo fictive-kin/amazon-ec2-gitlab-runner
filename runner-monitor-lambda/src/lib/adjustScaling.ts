@@ -1,6 +1,5 @@
 import * as asg from "@aws-sdk/client-auto-scaling";
 import {ClusterMetrics} from "./gatherMetrics";
-import {SdkError} from "@aws-sdk/types";
 
 export const adjustScaling = async (autoScalingGroupName : string, metrics : ClusterMetrics, desiredCount : number) => {
     if (metrics.currentInstances == desiredCount) {
@@ -32,8 +31,7 @@ export const adjustScaling = async (autoScalingGroupName : string, metrics : Clu
         console.log(`Setting desired capacity to ${desiredCount}`)
         await client.send(command)
     } catch (ex) {
-        const checkError = ex as SdkError
-        if (checkError?.name == "ScalingActivityInProgress") {
+        if (ex instanceof asg.ScalingActivityInProgressFault) {
             console.log(`Cannot modify autoscaling, since scaling is still in-progress, or in cool-down.`)
         } else {
             throw ex

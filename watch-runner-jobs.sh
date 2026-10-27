@@ -17,8 +17,10 @@ Usage: $(basename "$0") <stack-name> <region> [<aws-profile>] [--interval <secon
 Refreshes a view of the runner stack until you press Ctrl-C:
   - desired, minimum and maximum capacity of the autoscaling group
   - the total job count and target capacity published by the runner monitor Lambda
-  - each instance: lifecycle state, health, IP and its latest job count. An instance whose
-    count is more than 3 minutes old is shown as stale; the monitor replaces it after 5
+  - each instance: lifecycle state, health, IP, CPU, memory and swap use, memory pressure (PSI:
+    % of the last 10s in which every task waited for memory; high means thrashing) and its
+    latest job count. An instance whose count is more than 3 minutes old is shown as stale;
+    the monitor replaces it after 5
   - with GITLAB_TOKEN set, the runner's running jobs: project, job, stage, how long it has
     run, which instance runs it, and its link
 
@@ -173,15 +175,29 @@ fi
 # Refresh
 #
 
-# metric_queries <instance-id>...  -> MetricDataQueries JSON for the cluster and each instance
+# metric_queries <instance-id>...  -> MetricDataQueries JSON for the cluster and each instance.
+# Instance query IDs are a metric letter and the instance's index: j0 (jobs), c0 (CPU), m0 (memory),
+# s0 (swap), p0 (memory pressure).
 metric_queries() {
     jq -n --arg ns "${metric_namespace}" --arg stack "${stack_name}" --arg asg "${asg_name}" \
         --argjson ids "$(printf '%s\n' "$@" | jq -R . | jq -s 'map(select(. != ""))')" '
         def query($id; $name; $dims): {Id: $id, MetricStat: {Metric: {Namespace: $ns, MetricName: $name, Dimensions: $dims}, Period: 60, Stat: "Maximum"}};
         [query("jobs"; "\($stack)-job-count"; []),
          query("target"; "\($stack)-target-capacity"; [])]
-        + ($ids | to_entries | map(query("i\(.key)"; "\($stack)-instance-job-count";
-            [{Name: "AutoScalingGroupName", Value: $asg}, {Name: "InstanceId", Value: .value}])))'
+        + ($ids | to_entries | map(
+            [{Name: "AutoScalingGroupName", Value: $asg}, {Name: "InstanceId", Value: .value}] as $dims
+            | .key as $i
+            | {j: "job-count", c: "cpu", m: "memory", s: "swap", p: "memory-pressure"} | to_entries
+            | map(query("\(.key)\($i)"; "\($stack)-instance-\(.value)"; $dims))) | add // [])'
+}
+
+# percent_cell <value> <warn> <alert>  -> value as a whole percent, yellow from warn and red from alert
+percent_cell() {
+    [[ -z "$1" ]] && { pad 6 "-"; return; }
+    local whole=${1%.*} color=""
+    [[ "${whole}" -ge "$2" ]] && color=${YELLOW}
+    [[ "${whole}" -ge "$3" ]] && color=${RED}
+    pad 6 "${whole}%" "${color}"
 }
 
 render() {
@@ -220,11 +236,11 @@ render() {
     echo "Capacity  desired $(echo "${asg}" | jq -r .DesiredCapacity)  min $(echo "${asg}" | jq -r .MinSize)  max $(echo "${asg}" | jq -r .MaxSize)  target ${target:--}    Running jobs (CloudWatch) ${BOLD}${total:--}${RESET}"
     echo
 
-    echo "${BOLD}$(pad 21 INSTANCE) $(pad 20 STATE) $(pad 10 HEALTH) $(pad 16 IP) $(pad 8 UP) JOBS${RESET}"
+    echo "${BOLD}$(pad 21 INSTANCE) $(pad 20 STATE) $(pad 10 HEALTH) $(pad 16 IP) $(pad 8 UP) $(pad 6 CPU) $(pad 6 MEM) $(pad 6 SWAP) $(pad 6 PSI) JOBS${RESET}"
     if [[ -z "${instance_ids}" ]]; then
         echo "${DIM}(no instances)${RESET}"
     fi
-    local index=0 id state health ip launch up value stamp age state_color health_color jobs_cell
+    local index=0 id state health ip launch up value stamp age state_color health_color jobs_cell resources
     for id in ${instance_ids}; do
         state=$(echo "${asg}" | jq -r --arg id "${id}" '.Instances[] | select(.InstanceId == $id) | .LifecycleState')
         health=$(echo "${asg}" | jq -r --arg id "${id}" '.Instances[] | select(.InstanceId == $id) | .HealthStatus')
@@ -233,7 +249,7 @@ render() {
         up="-"
         [[ -n "${launch}" ]] && up=$(format_duration $((now - launch)))
 
-        read -r value stamp <<< "$(latest "i${index}")"
+        read -r value stamp <<< "$(latest "j${index}")"
         if [[ -z "${value:-}" ]]; then
             jobs_cell="${DIM}no data${RESET}"
         else
@@ -246,7 +262,9 @@ render() {
         state_color=""; health_color=""
         [[ "${state}" == "InService" ]] && state_color=${GREEN}
         [[ "${health}" != "Healthy" ]] && health_color=${RED}
-        echo "$(pad 21 "${id}") $(pad 20 "${state}" "${state_color}") $(pad 10 "${health}" "${health_color}") $(pad 16 "${ip}") $(pad 8 "${up}") ${jobs_cell}"
+        resources="$(percent_cell "$(latest "c${index}" | cut -d' ' -f1)" 90 101) $(percent_cell "$(latest "m${index}" | cut -d' ' -f1)" 85 95)"
+        resources+=" $(percent_cell "$(latest "s${index}" | cut -d' ' -f1)" 25 50) $(percent_cell "$(latest "p${index}" | cut -d' ' -f1)" 10 30)"
+        echo "$(pad 21 "${id}") $(pad 20 "${state}" "${state_color}") $(pad 10 "${health}" "${health_color}") $(pad 16 "${ip}") $(pad 8 "${up}") ${resources} ${jobs_cell}"
         index=$((index + 1))
     done
 
