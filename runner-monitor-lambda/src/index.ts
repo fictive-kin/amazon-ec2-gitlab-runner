@@ -22,6 +22,7 @@ import {ClusterMetrics, gatherClusterMetrics} from "./lib/gatherMetrics";
 import {publishMetrics} from "./lib/publishMetrics";
 import {adjustScaling} from "./lib/adjustScaling";
 import {replaceUnresponsiveInstance} from "./lib/replaceUnresponsive";
+import {protectBusyInstances} from "./lib/protectBusyInstances";
 
 export const handler = async (event : lambda.ScheduledEvent, context : lambda.Context | null) : Promise<void> => {
     const autoScalingGroupName = config.autoScalingGroupName()
@@ -35,6 +36,10 @@ export const handler = async (event : lambda.ScheduledEvent, context : lambda.Co
 
     console.log(`Publishing metrics`)
     await publishMetrics(metrics, desiredCapacity)
+
+    // Before scaling, so a scale-in removes idle instances
+    console.log(`Updating scale-in protection`)
+    await protectBusyInstances(autoScalingGroupName, metrics)
 
     console.log(`Adjusting autoscaling`)
     await adjustScaling(autoScalingGroupName, metrics, desiredCapacity)

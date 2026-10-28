@@ -216,6 +216,45 @@ if [[ -n "${document_log_group}" && "${document_log_group}" != "None" ]]; then
     fetch_logs logs/lifecycle-document.txt "${document_log_group}"
 fi
 
+# Graceful shutdown outcome per terminating instance, from the document's own output. SSM reports
+# most of these as Failed/Undeliverable even when they worked: the document's last step lets the
+# instance terminate before the agent reports back.
+if [[ -n "${document_name}" && "${document_name}" != "None" && -f "${out_dir}/logs/lifecycle-document.txt" ]]; then
+    echo "    graceful shutdown summary -> aws/lifecycle-shutdowns.txt"
+    {
+        echo "# Graceful shutdowns of terminating instances. SSM_STATUS is usually Undeliverable even when"
+        echo "# the shutdown worked, because the instance terminates before the SSM agent reports back;"
+        echo "# OUTCOME comes from the shutdown document's own output (logs/lifecycle-document.txt)."
+        echo "#   completed  runner unregistered, stopped after its jobs finished, lifecycle action completed"
+        echo "#   draining   waiting for running jobs to finish (or cut off while waiting)"
+        echo "#   no output  the document never ran, so jobs on the instance may have been killed"
+        printf '%-25s %-21s %-14s %-8s %s\n' REQUESTED INSTANCE SSM_STATUS DRAIN OUTCOME
+        awsr ssm list-command-invocations \
+            --filters "key=DocumentName,value=${document_name}" "key=InvokedAfter,value=${start_iso}Z" \
+            --query 'CommandInvocations[].[RequestedDateTime,InstanceId,StatusDetails]' --output text 2> /dev/null \
+            | sort | while read -r requested instance status; do
+                # Log lines are <timestamp ms> <command-id>/<instance-id>/<step>/<stream> <message>
+                awk -F'\t' -v id="${instance}" -v requested="${requested:0:19}${requested:26}" -v status="${status}" '
+                    index($2, "/" id "/") {
+                        if (first == "" || $1 < first) first = $1
+                        if (index($3, "Waiting for gitlab-runner to stop gracefully")) waiting = 1
+                        # Output is uploaded in pieces as the instance shuts down, so either line can be missing
+                        if (index($3, "completing lifecycle action") || $3 == "done") {
+                            if ($1 > completed) completed = $1
+                        }
+                    }
+                    END {
+                        drain = "-"
+                        if (completed != "") { outcome = "completed"; drain = sprintf("%ds", (completed - first) / 1000) }
+                        else if (waiting) outcome = "draining"
+                        else if (first != "") outcome = "started"
+                        else outcome = "no output"
+                        printf "%-25s %-21s %-14s %-8s %s\n", requested, id, status, drain, outcome
+                    }' "${out_dir}/logs/lifecycle-document.txt"
+            done
+    } > "${out_dir}/aws/lifecycle-shutdowns.txt"
+fi
+
 echo "==> Metrics (period ${period}s)"
 mkdir -p "${out_dir}/metrics"
 # metric <file> <namespace> <metric> <statistics> [dimensions...]
@@ -235,8 +274,12 @@ metric actual-capacity.txt "${metric_namespace}" "${stack_name}-actual-capacity"
 metric lambda-runner-monitor-errors.txt AWS/Lambda Errors "Sum" "Name=FunctionName,Value=${monitor_function}"
 capture metrics/available-runner-metrics.json cloudwatch list-metrics --namespace "${metric_namespace}"
 for instance_id in ${all_instance_ids}; do
-    metric "${instance_id}-job-count.txt" "${metric_namespace}" "${stack_name}-instance-job-count" "Average Maximum" \
-        "Name=AutoScalingGroupName,Value=${asg_name}" "Name=InstanceId,Value=${instance_id}"
+    # Published by each instance with its job count; the only record of memory trouble on
+    # instances that have since been terminated
+    for name in job-count cpu memory swap memory-pressure; do
+        metric "${instance_id}-runner-${name}.txt" "${metric_namespace}" "${stack_name}-instance-${name}" "Average Maximum" \
+            "Name=AutoScalingGroupName,Value=${asg_name}" "Name=InstanceId,Value=${instance_id}"
+    done
     metric "${instance_id}-cpu.txt" AWS/EC2 CPUUtilization "Average Maximum" "Name=InstanceId,Value=${instance_id}"
     metric "${instance_id}-cpu-credit-balance.txt" AWS/EC2 CPUCreditBalance "Average Minimum" "Name=InstanceId,Value=${instance_id}"
     metric "${instance_id}-cpu-surplus-credits-charged.txt" AWS/EC2 CPUSurplusCreditsCharged "Sum" "Name=InstanceId,Value=${instance_id}"
@@ -426,9 +469,12 @@ Window:     last ${hours} hours
 Instances:  ${instance_ids:-none}
 SSM online: ${online_ids:- none}
 
-aws/        stack, autoscaling group, instances, Lambda and SSM state
+aws/        stack, autoscaling group, instances, Lambda and SSM state;
+            lifecycle-shutdowns.txt has the graceful shutdown outcome of each terminated instance
 logs/       runner monitor Lambda, lifecycle hook Lambda and graceful shutdown document
-metrics/    runner job counts, capacity, and per-instance CPU, credits and status checks
+metrics/    runner job counts, capacity, and per instance: job count, CPU, memory, swap and
+            memory pressure published by the instance (*-runner-*.txt), EC2 CPU, credits
+            and status checks
 instances/  per instance: diagnostics.txt (collected on the instance), console output
 gitlab/     runner status and jobs from the GitLab API (only when GITLAB_TOKEN was set)
 EOF

@@ -27,6 +27,7 @@ export interface ClusterMetrics {
     activeInstances: number
     currentJobCount: number
     inServiceInstanceIds: string[]
+    protectedInstanceIds: string[]
     instances : InstanceMetrics[],
 }
 
@@ -41,6 +42,7 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
             minInstances: asgInfo.minSize,
             maxInstances: asgInfo.maxSize,
             inServiceInstanceIds: [],
+            protectedInstanceIds: [],
             instances: [],
         }
     }
@@ -69,6 +71,7 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
         minInstances: asgInfo.minSize,
         maxInstances: asgInfo.maxSize,
         inServiceInstanceIds: asgInfo.inServiceInstanceIds,
+        protectedInstanceIds: asgInfo.protectedInstanceIds,
         instances: metrics,
     }
 }
