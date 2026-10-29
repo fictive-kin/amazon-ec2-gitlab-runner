@@ -101,10 +101,10 @@ Once the docker executor image has been pushed to the Gitlab Container Registry,
 3.	Run the deploy script to deploy the runner: 
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
+./deploy-runner.sh <properties-file> [<region>] [<aws-profile>] <stack-name> 
 
 <properties-file> is the name of the properties file. 
-<region> is the region where you want to deploy the stack. 
+<region> is optional: the region where you want to deploy the stack. Leave it out to use AWS_REGION, AWS_DEFAULT_REGION or the region configured for the AWS CLI profile; the script asks for one if none is set. The other scripts take <region> the same way. Given only one of <region> and <aws-profile>, a value that looks like a region (us-east-1) is the region and anything else the profile. 
 <aws-profile> is optional: the name of the CLI profile you set up in the prerequisites section. Leave it out to use the AWS CLI's default credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables, AWS_PROFILE, or the default profile). 
 <stack-name> is the name you chose for the CloudFormation stack. 
 ```
@@ -135,20 +135,20 @@ InstanceType=t3a.large
 2.	Run the deploy-runner.sh script to update the CloudFormation stack:
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
+./deploy-runner.sh <properties-file> [<region>] [<aws-profile>] <stack-name> 
 ```
 
 ## Collecting diagnostics
 When the runner stops picking up jobs, collect its logs and state with:
 ```
-./collect-runner-diagnostics.sh <stack-name> <region> [<aws-profile>] [--hours <n>]
+./collect-runner-diagnostics.sh <stack-name> [<region>] [<aws-profile>] [--hours <n>]
 ```
-It writes `diagnostics/<stack-name>-<timestamp>/` and a `.tar.gz` of it, with the stack, autoscaling group, Lambda logs and metrics from AWS, and from each instance (through SSM Run Command) the gitlab-runner journal, redacted `config.toml`, `gitlab-runner verify`, a goroutine dump, docker state, memory, disk and OOM kills. Set `GITLAB_TOKEN` to also fetch the runners' status and recent jobs from GitLab. Tokens are redacted. For instances terminated during the window, the CPU, memory, swap and memory pressure they published are in `metrics/`, and `aws/lifecycle-shutdowns.txt` shows whether each one's graceful shutdown completed and how long it waited for jobs. SSM reports most of those shutdowns as Undeliverable even when they worked, because the instance terminates before the SSM agent reports back.
+It writes `diagnostics/<stack-name>-<timestamp>/` and a `.tar.gz` of it, with the stack, autoscaling group, Lambda logs and metrics from AWS, and from each instance (through SSM Run Command) the gitlab-runner journal, redacted `config.toml`, `gitlab-runner verify`, a goroutine dump, docker state, memory, disk and OOM kills. Set `GITLAB_TOKEN` to also fetch the runners' status and recent jobs from GitLab; both this script and `watch-runner-jobs.sh` also read it from a `.env` file in the repository root (`GITLAB_TOKEN=<token>`, git-ignored) when it isn't already set. Tokens are redacted. For instances terminated during the window, the CPU, memory, swap and memory pressure they published are in `metrics/`, and `aws/lifecycle-shutdowns.txt` shows whether each one's graceful shutdown completed and how long it waited for jobs. SSM reports most of those shutdowns as Undeliverable even when they worked, because the instance terminates before the SSM agent reports back.
 
 ## Watching running jobs
 To watch the stack live from your machine:
 ```
-GITLAB_TOKEN=<token> ./watch-runner-jobs.sh <stack-name> <region> [<aws-profile>] [--interval <seconds>] [--runner-id <id>]
+GITLAB_TOKEN=<token> ./watch-runner-jobs.sh <stack-name> [<region>] [<aws-profile>] [--interval <seconds>] [--runner-id <id>]
 ```
 It refreshes the autoscaling group's capacity and each instance's state, health, CPU, memory and swap use, memory pressure and running job count from CloudWatch (an instance whose count stops updating is shown as stale). Each instance publishes these every 30 seconds. Memory pressure (PSI) is the share of the last 10 seconds in which every task on the instance was waiting for memory: above about 10% the instance is thrashing and jobs slow down. With `GITLAB_TOKEN` set to a token that can read the runner, it also lists the jobs running right now, with the project, stage, how long each has run and which instance runs it. Without `--runner-id`, the runner ID is read once from an instance through SSM. `--once` prints the view a single time.
 
@@ -186,24 +186,32 @@ RunnersToken=glrt-exampletoken1,glrt-exampletoken2
 2.	Update the Gitlab Runner stack. This overwrites the SecureString SSM parameter `/<stack-name>/runner-tokens` that stores the tokens. If RunnersToken is empty, the stored tokens are kept. 
 ```
 cd <your-repo-dir>
-./deploy-runner.sh <properties-file> <region> [<aws-profile>] <stack-name> 
+./deploy-runner.sh <properties-file> [<region>] [<aws-profile>] <stack-name> 
 ```
 3.	Relaunch the instances in the Gitlab Runner autoscaling group. The new instances will use the new RunnersToken value. Run the following command to relaunch the instances:
 ```
-./cycle-runner.sh <runner-autoscaling-group-name> <region> <optional-aws-profile>
+./cycle-runner.sh <runner-autoscaling-group-name> [<region>] [<aws-profile>]
 ```
 To remove projects from the Gitlab Runner, follow the steps described above, with just one difference. Instead of adding new tokens to the RunnersToken parameter, remove the token(s) of the project that you want to dissociate from the runner.  
 
 ## Autoscale the runner based on custom performance metrics
 Each Gitlab Runner can be configured to handle a fixed number of [concurrent jobs](https://docs.gitlab.com/runner/configuration/advanced-configuration.html). Once this capacity is reached for every runner, any new jobs will be in a Queued/Waiting status until the current jobs complete, which would be a poor experience for our team. Setting the number of concurrent jobs too high on our runners would also result in a poor experience, because all jobs leverage the same CPU, memory, and storage in order to conduct the builds.
 
-In this solution, we utilize a scheduled Lambda function that runs every minute in order to inspect the number of jobs running on every runner. Each runner reads its job count from its local [Prometheus Metrics](https://docs.gitlab.com/ee/administration/monitoring/prometheus/gitlab_metrics.html#gitlab-prometheus-metrics) endpoint and publishes it to CloudWatch every 30 seconds, and the Lambda function reads those metrics, so it does not need to run inside the VPC. A runner that has not published recently is treated as unavailable. If we approach the concurrent build limit of the group, then we increase the Autoscaling Group size so that it can take on more work. As the number of concurrent jobs decreases, then the scheduled Lambda function will scale the Autoscaling Group back in an effort to minimize cost. The Scaling-Up operation will ignore the Autoscaling Group’s cooldown period, which will help ensure that our team is not waiting on a new instance, whereas the Scale-Down operation will obey the group’s cooldown period. Before scaling, the function protects instances that are running jobs from scale-in and removes the protection once they are idle, so a scale-in terminates idle instances first. An instance that picks up a job just before it is chosen still finishes the job through the termination lifecycle hook.
+In this solution, we utilize a scheduled Lambda function that runs every minute in order to inspect the number of jobs running on every runner. Each runner reads its job count from its local [Prometheus Metrics](https://docs.gitlab.com/ee/administration/monitoring/prometheus/gitlab_metrics.html#gitlab-prometheus-metrics) endpoint and publishes it to CloudWatch every 30 seconds, and the Lambda function reads those metrics, so it does not need to run inside the VPC. A runner that has not published recently is treated as unavailable. If we approach the concurrent build limit of the group, then we increase the Autoscaling Group size so that it can take on more work. As the number of concurrent jobs decreases, then the scheduled Lambda function will scale the Autoscaling Group back in an effort to minimize cost. The Scaling-Up operation will ignore the Autoscaling Group’s cooldown period, which will help ensure that our team is not waiting on a new instance, whereas the Scale-Down operation will obey the group’s cooldown period. Before scaling, the function protects instances that are running jobs from scale-in and removes the protection once they are idle, so a scale-in terminates idle instances first. Among idle instances it terminates one from an out of date launch template, then the newest, so a long-running instance keeps the images it has pulled. Instances are not replaced for their age unless `MaxInstanceLifetime` is set. An instance that picks up a job just before it is chosen still finishes the job through the termination lifecycle hook.
+
+The target capacity is enough instances for the running jobs plus `CountOfNewJobsBeforeScaling` free job slots (default 2), so new jobs start without waiting for an instance to boot. With 2 concurrent jobs per instance, 2 free slots adds a second instance as soon as one job starts; 1 adds it only once the first instance is full, which launches and terminates instances less often.
+
+A runner only sees a job once it takes it, so on running jobs alone a burst of jobs scales out one instance at a time: each new instance boots, fills up, and only then is the next one added. The monitor can also count the jobs waiting in GitLab and scale out for them in one step. Set `GitlabRunnerIds` in the properties file to the IDs of the project runners the stack runs (`setup-runner.sh` records it when it creates the runner), and pass a token that can read those runners and their projects' jobs when deploying, for example a project access token with the Maintainer role and `read_api` scope:
+```
+GitlabApiToken=<token> ./deploy-runner.sh <properties-file> [<region>] [<aws-profile>] <stack-name>
+```
+The token is stored as the SSM SecureString `/<stack-name>/gitlab-api-token`, so later deploys don't need it. `GitlabApiToken` can also go in a `.env` file in the repository root. If it isn't set but `GITLAB_TOKEN` is (from the environment or `.env`), `deploy-runner.sh` asks before storing that token for the monitor, unless it is already the stored one. A waiting job counts when the runner has all of its tags, or when it has none and the runner runs untagged jobs. This assumes no other runner takes those jobs, such as a GitLab.com shared runner for untagged jobs. Group and instance runners aren't counted. If the GitLab API can't be reached or the token is rejected (for example once it expires), the monitor logs why and scales on running jobs alone.
 
 Here is the logical sequence diagram for the work:
 
 <img src="Images/gitlab-runner-autoscaling.png" width="700">
 
-For operational monitoring, the Lambda function also publishes custom CloudWatch Metrics for the count of active jobs, along with the target and actual capacities of the Autoscaling group. We can utilize this information to validate that the system is working properly and determine if we need to modify any of our autoscaling parameters.
+For operational monitoring, the Lambda function also publishes custom CloudWatch Metrics for the count of active jobs and, when it can count them, waiting jobs, along with the target and actual capacities of the Autoscaling group. We can utilize this information to validate that the system is working properly and determine if we need to modify any of our autoscaling parameters.
 
 <img src="Images/example-metrics.png" width="700">
 

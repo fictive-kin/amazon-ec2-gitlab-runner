@@ -340,12 +340,14 @@ create_runner_with_api() {
         --data-urlencode "run_untagged=${run_untagged}") \
         || return 1
     RUNNER_TOKENS=$(echo "${response}" | jq -r '.token')
-    ok "Created runner $(echo "${response}" | jq -r '.id') for ${GITLAB_PROJECT_PATH}"
+    GITLAB_RUNNER_IDS=$(echo "${response}" | jq -r '.id')
+    ok "Created runner ${GITLAB_RUNNER_IDS} for ${GITLAB_PROJECT_PATH}"
 }
 
 configure_runner_tokens() {
     step "GitLab runner"
     RUNNER_TOKENS=""
+    GITLAB_RUNNER_IDS=""
 
     if [ "${TOKENS_STORED}" = true ]; then
         info "Runner tokens are already stored for this stack in SSM (/${STACK_NAME}/runner-tokens)."
@@ -382,6 +384,42 @@ configure_runner_tokens() {
         *,glrt-*) ;;
         *) warn "These don't look like runner authentication tokens (glrt-...). Legacy registration tokens are no longer supported." ;;
     esac
+
+    while true; do
+        ask GITLAB_RUNNER_IDS "Runner ID(s), comma separated, shown on each runner's page (optional; lets the monitor scale for waiting jobs)" ""
+        [[ "${GITLAB_RUNNER_IDS}" =~ ^([0-9]+(,[0-9]+)*)?$ ]] && break
+        warn "Runner IDs are numbers, separated by commas."
+    done
+}
+
+# Optional: lets the runner monitor count jobs waiting in GitLab, so a burst of jobs gets all its
+# instances in one scale-out instead of one at a time
+configure_monitor_token() {
+    step "Scaling on waiting jobs"
+    MONITOR_TOKEN=""
+    info "The runner monitor can also scale out for jobs waiting in GitLab. It needs a token that can read"
+    info "the runner and the project's jobs: a project access token with the Maintainer role and read_api"
+    info "scope, from ${GITLAB_PROJECT_WEB_URL}/-/settings/access_tokens"
+
+    if aws_cli ssm get-parameter --name "/${STACK_NAME}/gitlab-api-token" > /dev/null 2>&1; then
+        info "A token is already stored for this stack in SSM (/${STACK_NAME}/gitlab-api-token)."
+        confirm "Keep the stored token?" y && return 0
+    fi
+
+    while true; do
+        ask_secret MONITOR_TOKEN "GitLab token for the runner monitor (leave empty to skip)"
+        [[ "${MONITOR_TOKEN}" =~ ^[A-Za-z0-9_.-]*$ ]] && break
+        warn "Paste a single token: letters, numbers, '_', '.' and '-'."
+    done
+}
+
+# set_property KEY VALUE  -> replaces KEY's line in the properties file, or adds it
+set_property() {
+    local updated="${TEMP_DIR}/properties"
+    grep -v "^$1=" "${PROPERTIES_FILE}" > "${updated}"
+    echo "$1=$2" >> "${updated}"
+    cat "${updated}" > "${PROPERTIES_FILE}"
+    ok "Set $1 in ${PROPERTIES_FILE} to $2"
 }
 
 # check_registry_push USER TOKEN
@@ -657,13 +695,14 @@ MinSize=${MIN_SIZE}
 DesiredCapacity=${MIN_SIZE}
 MaxBatchSize=1
 MinInstancesInService=$([ "${MIN_SIZE}" -gt 0 ] && [ "${MAX_SIZE}" -gt 1 ] && echo 1 || echo 0)
-MaxInstanceLifetime=604800
+MaxInstanceLifetime=0
 GitlabServerURL="${GITLAB_URL}"
 DockerImagePath="${DOCKER_IMAGE_PATH}"
 GitlabRunnerVersion=${RUNNER_VERSION}
 LambdaS3Bucket=${LAMBDA_BUCKET}
 Concurrent=${CONCURRENT}
 CheckInterval=3
+GitlabRunnerIds=${GITLAB_RUNNER_IDS}
 SwapSize=4
 JobMemoryLimit=1536m
 ServiceMemoryLimit=512m
@@ -687,7 +726,8 @@ deploy() {
     local args=("${PROPERTIES_FILE}" "${AWS_REGION_NAME}")
     [ -n "${AWS_PROFILE_NAME}" ] && args+=("${AWS_PROFILE_NAME}")
     args+=("${STACK_NAME}")
-    RunnersToken="${RUNNER_TOKENS}" ./deploy-runner.sh "${args[@]}" \
+    # GITLAB_TOKEN is cleared because the monitor's token was already asked for above
+    GITLAB_TOKEN="" RunnersToken="${RUNNER_TOKENS}" GitlabApiToken="${MONITOR_TOKEN}" ./deploy-runner.sh "${args[@]}" \
         || die "Deployment failed. Check the stack's Events tab in the CloudFormation console for the first failure."
 }
 
@@ -732,10 +772,13 @@ main() {
     fi
 
     configure_runner_tokens
+    configure_monitor_token
 
     if [ "${reuse}" = true ]; then
         load_existing_properties
         LAMBDA_BUCKET=${LambdaS3Bucket}
+        # A new runner replaces the one the properties name
+        [ -n "${GITLAB_RUNNER_IDS}" ] && set_property GitlabRunnerIds "${GITLAB_RUNNER_IDS}"
         if confirm "Rebuild and push the executor image (currently ${DOCKER_IMAGE_PATH})?" n; then
             configure_executor_image
             update_properties_image

@@ -23,6 +23,7 @@ import {publishMetrics} from "./lib/publishMetrics";
 import {adjustScaling} from "./lib/adjustScaling";
 import {replaceUnresponsiveInstance} from "./lib/replaceUnresponsive";
 import {protectBusyInstances} from "./lib/protectBusyInstances";
+import {countPendingJobs} from "./lib/pendingJobs";
 
 export const handler = async (event : lambda.ScheduledEvent, context : lambda.Context | null) : Promise<void> => {
     const autoScalingGroupName = config.autoScalingGroupName()
@@ -30,12 +31,15 @@ export const handler = async (event : lambda.ScheduledEvent, context : lambda.Co
     console.log(`Retrieving cluster metrics`)
     const metrics = await gatherClusterMetrics(autoScalingGroupName)
 
+    console.log(`Counting pending jobs`)
+    const pendingJobCount = await countPendingJobs()
+
     console.log(`Determining desired capacity`)
-    const desiredCapacity = determineDesiredCapacity(metrics)
+    const desiredCapacity = determineDesiredCapacity(metrics, pendingJobCount ?? 0)
     console.log(`Desired Capacity: ${desiredCapacity}`)
 
     console.log(`Publishing metrics`)
-    await publishMetrics(metrics, desiredCapacity)
+    await publishMetrics(metrics, pendingJobCount, desiredCapacity)
 
     // Before scaling, so a scale-in removes idle instances
     console.log(`Updating scale-in protection`)
@@ -50,14 +54,15 @@ export const handler = async (event : lambda.ScheduledEvent, context : lambda.Co
     console.log(`Done`)
 }
 
-const determineDesiredCapacity = (metrics : ClusterMetrics) : number => {
+const determineDesiredCapacity = (metrics : ClusterMetrics, pendingJobCount : number) : number => {
     // the number of jobs that can run concurrently per runner
     const concurrentJobsPerRunner = config.maximumConcurrentJobsPerRunner()
     // the number of new jobs we want to be able to handle within triggering another scaling event
     const newJobCountBeforeScaling = config.countOfNewJobsBeforeScaling();
 
-    // pretend like we're going to add more jobs, and figure out the number of instances we need to handle that
-    let desiredCapacity = (metrics.currentJobCount + newJobCountBeforeScaling) / concurrentJobsPerRunner
+    // pretend like we're going to add more jobs, and figure out the number of instances we need to handle that.
+    // Jobs waiting in GitLab count as running, so a burst gets all its instances in one scale-out
+    let desiredCapacity = (metrics.currentJobCount + pendingJobCount + newJobCountBeforeScaling) / concurrentJobsPerRunner
     desiredCapacity = Math.ceil(desiredCapacity)
     // Make sure we dont go below our min
     desiredCapacity = Math.max(desiredCapacity, metrics.minInstances)

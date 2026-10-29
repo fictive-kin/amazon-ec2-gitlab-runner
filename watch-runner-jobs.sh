@@ -10,13 +10,70 @@ set -uo pipefail
 
 export AWS_PAGER=""
 
+# Loads KEY=VALUE lines, such as GITLAB_TOKEN, from .env next to this script. A variable already
+# set in the environment wins. The file is read, not sourced, so it can't run commands.
+load_env() {
+    local file line key value
+    file="$(dirname "$0")/.env"
+    [[ -f "${file}" ]] || return 0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line=${line%$'\r'}
+        [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[2]}
+        value=${BASH_REMATCH[3]}
+        if [[ "${value}" =~ ^\"(.*)\"[[:space:]]*$ || "${value}" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+            value=${BASH_REMATCH[1]}
+        else
+            # Unquoted: drop a trailing " # comment" and trailing whitespace
+            value=${value%%[[:space:]]#*}
+            value=${value%"${value##*[![:space:]]}"}
+        fi
+        [[ -n "${!key+set}" ]] || export "${key}=${value}"
+    done < "${file}"
+}
+load_env
+
+is_region() {
+    [[ "$1" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]
+}
+
+# Splits the optional <region> [<aws-profile>] arguments. A lone one that looks like a region
+# (us-east-1) is the region; anything else is the profile.
+split_region_and_profile() {
+    region=""
+    profile=""
+    if [[ "$#" -eq 2 ]]; then
+        is_region "$1" || { echo "Not an AWS region: $1" >&2; exit 1; }
+        region=$1
+        profile=$2
+    elif [[ "$#" -eq 1 ]]; then
+        if is_region "$1"; then region=$1; else profile=$1; fi
+    fi
+}
+
+# Without a region argument: AWS_REGION, AWS_DEFAULT_REGION or the profile's configured region,
+# as the AWS CLI would use, else asks for one
+resolve_region() {
+    [[ -n "${region}" ]] && return 0
+    region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+    [[ -n "${region}" ]] || region=$(aws configure get region ${profile:+--profile "${profile}"} 2> /dev/null || true)
+    until is_region "${region}"; do
+        if [[ ! -t 0 ]]; then
+            echo "No AWS region: pass one, or set AWS_REGION or AWS_DEFAULT_REGION" >&2
+            exit 1
+        fi
+        read -r -p "AWS region (e.g. us-east-1): " region || exit 1
+    done
+}
+
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <stack-name> <region> [<aws-profile>] [--interval <seconds>] [--once] [--runner-id <id>]
+Usage: $(basename "$0") <stack-name> [<region>] [<aws-profile>] [--interval <seconds>] [--once] [--runner-id <id>]
 
 Refreshes a view of the runner stack until you press Ctrl-C:
   - desired, minimum and maximum capacity of the autoscaling group
-  - the total job count and target capacity published by the runner monitor Lambda
+  - the total job count, the jobs waiting in GitLab (with GitlabRunnerIds and a GitLab API
+    token configured) and the target capacity published by the runner monitor Lambda
   - each instance: lifecycle state, health, IP, CPU, memory and swap use, memory pressure (PSI:
     % of the last 10s in which every task waited for memory; high means thrashing) and its
     latest job count. An instance whose count is more than 3 minutes old is shown as stale;
@@ -28,9 +85,12 @@ The CloudWatch counts lag by up to a minute; the GitLab list is current.
 
 Arguments:
   stack-name            CloudFormation stack name
-  region                AWS region of the stack, e.g. us-east-1
+  region                Optional AWS region of the stack, e.g. us-east-1. Without it,
+                        AWS_REGION, AWS_DEFAULT_REGION or the profile's configured region
+                        is used, and you're asked for one if none is set
   aws-profile           Optional AWS CLI profile. Without it, the AWS CLI's default
-                        credentials are used
+                        credentials are used. Given alone, an argument that looks like a
+                        region (us-east-1) is the region and anything else the profile
 
 Options:
   --interval <seconds>  Time between refreshes (default 15)
@@ -39,7 +99,7 @@ Options:
                         once from an instance's config.toml through SSM
   -h, --help, -?        Show this help and exit
 
-Environment:
+Environment (also read from .env next to this script; a variable already set wins):
   GITLAB_TOKEN          Optional GitLab access token that can read the runner's jobs
   GITLAB_RUNNER_ID      Same as --runner-id
 EOF
@@ -68,10 +128,10 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-if [[ "${#positional[@]}" -lt 2 || "${#positional[@]}" -gt 3 ]]
+if [[ "${#positional[@]}" -lt 1 || "${#positional[@]}" -gt 3 ]]
 then
     echo "Incorrect number of arguments" >&2
-    echo "Usage: $(basename "$0") <stack-name> <region> [<aws-profile>] [--interval <seconds>] [--once] [--runner-id <id>]" >&2
+    echo "Usage: $(basename "$0") <stack-name> [<region>] [<aws-profile>] [--interval <seconds>] [--once] [--runner-id <id>]" >&2
     echo "Run '$(basename "$0") --help' for details." >&2
     exit 1
 fi
@@ -79,10 +139,11 @@ fi
 command -v jq > /dev/null || { echo "jq is required (brew install jq)" >&2; exit 1; }
 
 stack_name=${positional[0]}
-region=${positional[1]}
+split_region_and_profile "${positional[@]:1}"
+resolve_region
 profile_args=()
-if [[ -n "${positional[2]:-}" ]]; then
-    profile_args=(--profile "${positional[2]}")
+if [[ -n "${profile}" ]]; then
+    profile_args=(--profile "${profile}")
 fi
 
 asg_name="${stack_name}-asg"
@@ -183,6 +244,7 @@ metric_queries() {
         --argjson ids "$(printf '%s\n' "$@" | jq -R . | jq -s 'map(select(. != ""))')" '
         def query($id; $name; $dims): {Id: $id, MetricStat: {Metric: {Namespace: $ns, MetricName: $name, Dimensions: $dims}, Period: 60, Stat: "Maximum"}};
         [query("jobs"; "\($stack)-job-count"; []),
+         query("pending"; "\($stack)-pending-job-count"; []),
          query("target"; "\($stack)-target-capacity"; [])]
         + ($ids | to_entries | map(
             [{Name: "AutoScalingGroupName", Value: $asg}, {Name: "InstanceId", Value: .value}] as $dims
@@ -228,12 +290,14 @@ render() {
             | "\(.Values[0]) \(.Timestamps[0] | epoch)"' 2> /dev/null
     }
 
-    local total target
+    local total pending target
     total=$(latest jobs | cut -d' ' -f1)
+    # Only published when the monitor could count them; "-" means no token or runner IDs, or a GitLab API error
+    pending=$(latest pending | cut -d' ' -f1)
     target=$(latest target | cut -d' ' -f1)
 
     echo "${BOLD}${stack_name}${RESET}  ${DIM}$(date '+%H:%M:%S')${RESET}"
-    echo "Capacity  desired $(echo "${asg}" | jq -r .DesiredCapacity)  min $(echo "${asg}" | jq -r .MinSize)  max $(echo "${asg}" | jq -r .MaxSize)  target ${target:--}    Running jobs (CloudWatch) ${BOLD}${total:--}${RESET}"
+    echo "Capacity  desired $(echo "${asg}" | jq -r .DesiredCapacity)  min $(echo "${asg}" | jq -r .MinSize)  max $(echo "${asg}" | jq -r .MaxSize)  target ${target:--}    Running jobs (CloudWatch) ${BOLD}${total:--}${RESET}  Waiting ${BOLD}${pending:--}${RESET}"
     echo
 
     echo "${BOLD}$(pad 21 INSTANCE) $(pad 20 STATE) $(pad 10 HEALTH) $(pad 16 IP) $(pad 8 UP) $(pad 6 CPU) $(pad 6 MEM) $(pad 6 SWAP) $(pad 6 PSI) JOBS${RESET}"

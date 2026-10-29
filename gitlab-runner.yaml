@@ -52,8 +52,8 @@ Parameters:
     Description: "The minimum number of instances that must be in service within the Auto Scaling group while CloudFormation updates old instances."
   MaxInstanceLifetime:
     Type: Number
-    Description: The maximum amount of time, in seconds, that an instance can be in service. If specified, the value must be either 0 or a number equal to or greater than 86,400 seconds (1 day).
-    Default: 604800
+    Description: The maximum amount of time, in seconds, that an instance can be in service before it is replaced. 0 (the default) never replaces an instance for its age; instances are still replaced on scale-in, on a deploy that changes the launch template (including a newer AMI) and by cycle-runner.sh. Otherwise at least 86,400 seconds (1 day).
+    Default: 0
   GitlabServerURL:
     Type: String
     Description: URL of the Gitlab server
@@ -87,6 +87,11 @@ Parameters:
     Type: Number
     Default: 2
     Description: The number of jobs that we should be able to take before needing to wait on a scaling event.
+  GitlabRunnerIds:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([0-9]+(,[0-9]+)*)?$"
+    Description: Comma separated IDs of the GitLab project runners this stack runs. With a GitLab API token stored by deploy-runner.sh (GitlabApiToken), the runner monitor counts the jobs waiting for them and scales out for those too, instead of one instance at a time as each fills up. Empty scales on running jobs only.
   AssociatePublicIpAddress:
     Type: String
     Default: "false"
@@ -102,17 +107,22 @@ Parameters:
     Type: Number
     Default: 4
     MinValue: 0
-    Description: Size in GiB of a swap file on the root volume, so a memory spike slows the instance instead of hanging it. 0 disables swap.
+    Description: Size in GiB of a swap file on the root volume, so a memory spike outside a job's containers (the runner, Docker, containers started through the mounted docker socket) slows the instance instead of hanging it. Job and service containers can't swap. 0 disables swap.
   JobMemoryLimit:
     Type: String
     Default: "1536m"
     AllowedPattern: "^[0-9]+[bkmg]?$"
-    Description: Memory limit for each job's build container (docker --memory, e.g. 1536m or 2g). Containers started through the mounted docker socket are not limited.
+    Description: Memory limit for each job's build container (docker --memory, e.g. 1536m or 2g). The container can't swap, so a job that goes over is killed (OOMKilled) instead of thrashing until it times out. Containers started through the mounted docker socket are not limited.
   ServiceMemoryLimit:
     Type: String
     Default: "512m"
     AllowedPattern: "^[0-9]+[bkmg]?$"
-    Description: Memory limit for each service container of a job (docker --memory, e.g. 512m).
+    Description: Memory limit for each service container of a job (docker --memory, e.g. 512m). Like the build container, it can't swap.
+  JobShmSize:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Size in bytes of /dev/shm in each job's build container, counted against JobMemoryLimit when used. 0 keeps Docker's 64 MB, which headless browsers (Firefox in particular) can run out of; 1073741824 is 1 GiB.
   DockerPullPolicy:
     Type: String
     Default: "if-not-present,always"
@@ -269,9 +279,9 @@ Resources:
             # The setup in Metadata runs once, at launch; changing Metadata alone doesn't create a new
             # launch template version, so instances wouldn't be replaced. The settings it uses are listed
             # here so that changing one replaces the instances. Bump SetupRevision after editing Metadata.
-            # SetupRevision=2 Concurrent=${Concurrent} CheckInterval=${CheckInterval} GitlabServerURL=${GitlabServerURL}
+            # SetupRevision=3 Concurrent=${Concurrent} CheckInterval=${CheckInterval} GitlabServerURL=${GitlabServerURL}
             # DockerImagePath=${DockerImagePath} DockerPullPolicy=${DockerPullPolicy} GitlabRunnerVersion=${GitlabRunnerVersion}
-            # JobMemoryLimit=${JobMemoryLimit} ServiceMemoryLimit=${ServiceMemoryLimit} SwapSize=${SwapSize}
+            # JobMemoryLimit=${JobMemoryLimit} ServiceMemoryLimit=${ServiceMemoryLimit} SwapSize=${SwapSize} JobShmSize=${JobShmSize}
             yum update -y aws-cfn-bootstrap
             /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource RunnerLaunchTemplate --region ${AWS::Region}
             /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource RunnerAutoScalingGroup --region ${AWS::Region}
@@ -375,10 +385,13 @@ Resources:
             05StartGitlabRunner:
               command: sudo systemctl daemon-reload && sudo systemctl enable --now gitlab-runner
             06CreateSwap:
-              # Low swappiness keeps swap as a safety net rather than something used routinely
+              # Low swappiness keeps swap as a safety net rather than something used routinely.
+              # fallocate reserves the space at once, where writing it with dd took about 50s for
+              # 6 GiB; dd remains for a filesystem that can't preallocate.
               command: !Sub |
                 if [ "${SwapSize}" -gt 0 ] && [ ! -f /swapfile ]; then
-                    dd if=/dev/zero of=/swapfile bs=1M count=$((${SwapSize} * 1024)) status=none
+                    fallocate -l ${SwapSize}G /swapfile \
+                        || { rm -f /swapfile; dd if=/dev/zero of=/swapfile bs=1M count=$((${SwapSize} * 1024)) status=none; }
                     chmod 600 /swapfile
                     mkswap /swapfile
                     swapon /swapfile
@@ -395,12 +408,18 @@ Resources:
               # keeps only the last value. request_concurrency lets the runner ask GitLab for up to
               # Concurrent jobs at once; with the default of 1, long polling delays picking up jobs.
               # The cache is shared by all instances through S3, using the instance role.
+              # memory_swap equal to the memory limit keeps job containers out of swap: Docker
+              # otherwise lets a container swap as much again, and a job over its limit thrashes
+              # for many minutes before failing instead of being killed.
               command: !Sub |
                 cat > /etc/gitlab-runner/register-template.toml <<EOF
                 [[runners]]
                   request_concurrency = ${Concurrent}
                   [runners.docker]
                     pull_policy = [$(echo "${DockerPullPolicy}" | sed 's/[^,]*/"&"/g; s/,/, /g')]
+                    memory_swap = "${JobMemoryLimit}"
+                    service_memory_swap = "${ServiceMemoryLimit}"
+                    shm_size = ${JobShmSize}
                   [runners.cache]
                     Type = "s3"
                     Shared = true
@@ -471,10 +490,11 @@ Resources:
           Value: !Ref CostCenter
           PropagateAtLaunch : true
       TerminationPolicies:
-        # If the launch configuration is out of date, then replace it.
-        # Otherwise we kill the oldest instance and let the runnerManager bring up new instances with latest config ie tokens
-        - OldestLaunchConfiguration
-        - OldestInstance
+        # Scale-in removes an instance from an out of date launch template first. Otherwise it
+        # removes the newest idle instance, so a long-running one keeps its pulled images and
+        # isn't replaced for its age. Token changes roll out through cycle-runner.sh.
+        - OldestLaunchTemplate
+        - NewestInstance
       VPCZoneIdentifier: !Ref "SubnetIds"
       ServiceLinkedRoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
 
@@ -616,6 +636,10 @@ Resources:
                   - "cloudwatch:PutMetricData"
                 Resource:
                   - "*"
+              # GitLab API token for counting pending jobs; a SecureString written by deploy-runner.sh
+              - Effect: Allow
+                Action: "ssm:GetParameter"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/gitlab-api-token"
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 
@@ -643,6 +667,10 @@ Resources:
           RUNNER_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-job-count"
           RUNNER_TARGET_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-target-capacity"
           RUNNER_ACTUAL_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-actual-capacity"
+          RUNNER_PENDING_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-pending-job-count"
+          GITLAB_URL: !Ref GitlabServerURL
+          GITLAB_RUNNER_IDS: !Ref GitlabRunnerIds
+          GITLAB_API_TOKEN_PARAMETER: !Sub "/${AWS::StackName}/gitlab-api-token"
       Tags:
         - Key: "APP_ID"
           Value: !Ref AppId

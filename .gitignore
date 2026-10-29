@@ -4,3 +4,6 @@
 
 # Output of collect-runner-diagnostics.sh; contains environment details
 diagnostics/
+
+# GITLAB_TOKEN and other settings for deploy-runner.sh, watch-runner-jobs.sh and collect-runner-diagnostics.sh
+.env

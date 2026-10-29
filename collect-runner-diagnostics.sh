@@ -12,9 +12,65 @@ set -uo pipefail
 
 export AWS_PAGER=""
 
+# Loads KEY=VALUE lines, such as GITLAB_TOKEN, from .env next to this script. A variable already
+# set in the environment wins. The file is read, not sourced, so it can't run commands.
+load_env() {
+    local file line key value
+    file="$(dirname "$0")/.env"
+    [[ -f "${file}" ]] || return 0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line=${line%$'\r'}
+        [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[2]}
+        value=${BASH_REMATCH[3]}
+        if [[ "${value}" =~ ^\"(.*)\"[[:space:]]*$ || "${value}" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+            value=${BASH_REMATCH[1]}
+        else
+            # Unquoted: drop a trailing " # comment" and trailing whitespace
+            value=${value%%[[:space:]]#*}
+            value=${value%"${value##*[![:space:]]}"}
+        fi
+        [[ -n "${!key+set}" ]] || export "${key}=${value}"
+    done < "${file}"
+}
+load_env
+
+is_region() {
+    [[ "$1" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]
+}
+
+# Splits the optional <region> [<aws-profile>] arguments. A lone one that looks like a region
+# (us-east-1) is the region; anything else is the profile.
+split_region_and_profile() {
+    region=""
+    profile=""
+    if [[ "$#" -eq 2 ]]; then
+        is_region "$1" || { echo "Not an AWS region: $1" >&2; exit 1; }
+        region=$1
+        profile=$2
+    elif [[ "$#" -eq 1 ]]; then
+        if is_region "$1"; then region=$1; else profile=$1; fi
+    fi
+}
+
+# Without a region argument: AWS_REGION, AWS_DEFAULT_REGION or the profile's configured region,
+# as the AWS CLI would use, else asks for one
+resolve_region() {
+    [[ -n "${region}" ]] && return 0
+    region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+    [[ -n "${region}" ]] || region=$(aws configure get region ${profile:+--profile "${profile}"} 2> /dev/null || true)
+    until is_region "${region}"; do
+        if [[ ! -t 0 ]]; then
+            echo "No AWS region: pass one, or set AWS_REGION or AWS_DEFAULT_REGION" >&2
+            exit 1
+        fi
+        read -r -p "AWS region (e.g. us-east-1): " region || exit 1
+    done
+}
+
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <stack-name> <region> [<aws-profile>] [--hours <n>]
+Usage: $(basename "$0") <stack-name> [<region>] [<aws-profile>] [--hours <n>]
 
 Collects logs and setup information for a deployed GitLab Runner stack into
 diagnostics/<stack-name>-<timestamp>/ and a .tar.gz of that directory.
@@ -32,15 +88,18 @@ collected because they may contain secrets.
 
 Arguments:
   stack-name        CloudFormation stack name
-  region            AWS region of the stack, e.g. us-east-1
+  region            Optional AWS region of the stack, e.g. us-east-1. Without it,
+                    AWS_REGION, AWS_DEFAULT_REGION or the profile's configured region
+                    is used, and you're asked for one if none is set
   aws-profile       Optional AWS CLI profile. Without it, the AWS CLI's default
-                    credentials are used
+                    credentials are used. Given alone, an argument that looks like a
+                    region (us-east-1) is the region and anything else the profile
 
 Options:
   --hours <n>       How many hours of logs and metrics to collect (default 24)
   -h, --help, -?    Show this help and exit
 
-Environment:
+Environment (also read from .env next to this script; a variable already set wins):
   GITLAB_TOKEN      Optional GitLab access token that can read the runners. When set,
                     the runners' status and recent jobs are fetched from the GitLab API
 EOF
@@ -61,19 +120,20 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-if [[ "${#positional[@]}" -lt 2 || "${#positional[@]}" -gt 3 ]]
+if [[ "${#positional[@]}" -lt 1 || "${#positional[@]}" -gt 3 ]]
 then
     echo "Incorrect number of arguments" >&2
-    echo "Usage: $(basename "$0") <stack-name> <region> [<aws-profile>] [--hours <n>]" >&2
+    echo "Usage: $(basename "$0") <stack-name> [<region>] [<aws-profile>] [--hours <n>]" >&2
     echo "Run '$(basename "$0") --help' for details." >&2
     exit 1
 fi
 
 stack_name=${positional[0]}
-region=${positional[1]}
+split_region_and_profile "${positional[@]:1}"
+resolve_region
 profile_args=()
-if [[ -n "${positional[2]:-}" ]]; then
-    profile_args=(--profile "${positional[2]}")
+if [[ -n "${profile}" ]]; then
+    profile_args=(--profile "${profile}")
 fi
 
 cd "$(dirname "$0")" || exit 1
@@ -269,6 +329,7 @@ metric() {
         --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Average,Minimum,Maximum,Sum,SampleCount]' --output text
 }
 metric job-count.txt "${metric_namespace}" "${stack_name}-job-count" "Average Maximum"
+metric pending-job-count.txt "${metric_namespace}" "${stack_name}-pending-job-count" "Average Maximum"
 metric target-capacity.txt "${metric_namespace}" "${stack_name}-target-capacity" "Average Maximum"
 metric actual-capacity.txt "${metric_namespace}" "${stack_name}-actual-capacity" "Average Maximum"
 metric lambda-runner-monitor-errors.txt AWS/Lambda Errors "Sum" "Name=FunctionName,Value=${monitor_function}"
