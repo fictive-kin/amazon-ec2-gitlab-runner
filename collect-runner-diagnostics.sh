@@ -337,7 +337,7 @@ capture metrics/available-runner-metrics.json cloudwatch list-metrics --namespac
 for instance_id in ${all_instance_ids}; do
     # Published by each instance with its job count; the only record of memory trouble on
     # instances that have since been terminated
-    for name in job-count cpu memory swap memory-pressure; do
+    for name in job-count cpu memory swap memory-pressure disk; do
         metric "${instance_id}-runner-${name}.txt" "${metric_namespace}" "${stack_name}-instance-${name}" "Average Maximum" \
             "Name=AutoScalingGroupName,Value=${asg_name}" "Name=InstanceId,Value=${instance_id}"
     done
@@ -427,6 +427,17 @@ if [[ -n "${instance_ids}" ]]; then
             --query 'InstanceInformationList[0].PingStatus' --output text 2> /dev/null)
         if [[ "${ping}" == "Online" ]]; then
             online_ids="${online_ids} ${instance_id}"
+            continue
+        fi
+        # The group can scale in while the bundle is collected, so an instance in the snapshot
+        # above may be gone by now. Its graceful shutdown came after the logs were fetched, so
+        # it is only in a later bundle
+        state=$(awsr ec2 describe-instances --instance-ids "${instance_id}" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2> /dev/null)
+        if [[ -n "${state}" && "${state}" != "running" && "${state}" != "None" ]]; then
+            echo "Instance was ${state} during collection, after the autoscaling snapshot in aws/. On-instance diagnostics could not be collected." \
+                > "${out_dir}/instances/${instance_id}/ssm-unavailable.txt"
+            echo "    ! ${instance_id} is ${state} (scaled in during collection)"
         else
             echo "SSM agent ping status: ${ping:-unknown}. On-instance diagnostics could not be collected." \
                 > "${out_dir}/instances/${instance_id}/ssm-unavailable.txt"

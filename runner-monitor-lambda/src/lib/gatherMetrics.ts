@@ -17,6 +17,8 @@ export interface InstanceMetrics {
     jobCount: number
     // age of the latest job count, or null when none was published in the lookback window
     metricAgeSeconds: number | null
+    // % of the root volume in use (Docker's images and volumes live there), or null when unknown
+    diskUsedPercent: number | null
     error : string | null
 }
 
@@ -28,6 +30,9 @@ export interface ClusterMetrics {
     currentJobCount: number
     inServiceInstanceIds: string[]
     protectedInstanceIds: string[]
+    unhealthyInstanceIds: string[]
+    outdatedInstanceIds: string[]
+    suspendedProcesses: string[]
     instances : InstanceMetrics[],
 }
 
@@ -43,6 +48,9 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
             maxInstances: asgInfo.maxSize,
             inServiceInstanceIds: [],
             protectedInstanceIds: [],
+            unhealthyInstanceIds: [],
+            outdatedInstanceIds: [],
+            suspendedProcesses: asgInfo.suspendedProcesses,
             instances: [],
         }
     }
@@ -72,6 +80,9 @@ export const gatherClusterMetrics = async (autoScalingGroupName : string) : Prom
         maxInstances: asgInfo.maxSize,
         inServiceInstanceIds: asgInfo.inServiceInstanceIds,
         protectedInstanceIds: asgInfo.protectedInstanceIds,
+        unhealthyInstanceIds: asgInfo.unhealthyInstanceIds,
+        outdatedInstanceIds: asgInfo.outdatedInstanceIds,
+        suspendedProcesses: asgInfo.suspendedProcesses,
         instances: metrics,
     }
 }
@@ -84,28 +95,34 @@ const getInstanceMetrics = async (autoScalingGroupName: string, instanceIds: str
         tls: true,
     })
 
+    const query = (id : string, metricName : string, instanceId : string) : cw.MetricDataQuery => {
+        return {
+            Id: id,
+            MetricStat: {
+                Metric: {
+                    Namespace: config.runnerMetricNamespace(),
+                    MetricName: metricName,
+                    Dimensions: [
+                        {Name: "AutoScalingGroupName", Value: autoScalingGroupName},
+                        {Name: "InstanceId", Value: instanceId},
+                    ],
+                },
+                Period: 60,
+                Stat: "Maximum",
+            },
+        }
+    }
+    const diskMetricName = config.runnerInstanceDiskMetricName()
+
     const now = new Date()
     const command = new cw.GetMetricDataCommand({
         StartTime: new Date(now.getTime() - metricLookbackSeconds * 1000),
         EndTime: now,
         ScanBy: cw.ScanBy.TIMESTAMP_DESCENDING,
-        MetricDataQueries: instanceIds.map((instanceId, index): cw.MetricDataQuery => {
-            return {
-                Id: `instance${index}`,
-                MetricStat: {
-                    Metric: {
-                        Namespace: config.runnerMetricNamespace(),
-                        MetricName: config.runnerInstanceJobCountMetricName(),
-                        Dimensions: [
-                            {Name: "AutoScalingGroupName", Value: autoScalingGroupName},
-                            {Name: "InstanceId", Value: instanceId},
-                        ],
-                    },
-                    Period: 60,
-                    Stat: "Maximum",
-                },
-            }
-        }),
+        MetricDataQueries: instanceIds.flatMap((instanceId, index): cw.MetricDataQuery[] => [
+            query(`instance${index}`, config.runnerInstanceJobCountMetricName(), instanceId),
+            ...(diskMetricName ? [query(`disk${index}`, diskMetricName, instanceId)] : []),
+        ]),
     })
 
     const response = await client.send(command)
@@ -115,20 +132,21 @@ const getInstanceMetrics = async (autoScalingGroupName: string, instanceIds: str
         const result = results.find(r => r.Id == `instance${index}`)
         const latestTimestamp = result?.Timestamps?.[0]
         const latestValue = result?.Values?.[0]
+        const diskUsedPercent = results.find(r => r.Id == `disk${index}`)?.Values?.[0] ?? null
 
         if (latestTimestamp == null || latestValue == null) {
             console.log(`No job count metric found for instance ${instanceId}`)
-            return {instanceId, jobCount: 0, metricAgeSeconds: null, error: "no job count metric found"}
+            return {instanceId, jobCount: 0, metricAgeSeconds: null, diskUsedPercent, error: "no job count metric found"}
         }
 
         const ageSeconds = (now.getTime() - latestTimestamp.getTime()) / 1000
         if (ageSeconds > maximumMetricAgeSeconds) {
             console.log(`Job count metric for instance ${instanceId} is stale (${ageSeconds}s old)`)
-            return {instanceId, jobCount: 0, metricAgeSeconds: ageSeconds, error: "job count metric is stale"}
+            return {instanceId, jobCount: 0, metricAgeSeconds: ageSeconds, diskUsedPercent, error: "job count metric is stale"}
         }
 
         console.log(`For instance: ${instanceId} Build Count is ${latestValue}`)
-        return {instanceId, jobCount: latestValue, metricAgeSeconds: ageSeconds, error: null}
+        return {instanceId, jobCount: latestValue, metricAgeSeconds: ageSeconds, diskUsedPercent, error: null}
     })
 }
 

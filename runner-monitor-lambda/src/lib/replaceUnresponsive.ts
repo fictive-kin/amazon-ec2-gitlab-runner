@@ -11,7 +11,8 @@ const isUnresponsive = (instance : InstanceMetrics) : boolean => {
 
 // Marks at most one unresponsive instance unhealthy per run, so the autoscaling group replaces it.
 // The termination lifecycle hook still stops the runner gracefully if the instance can be reached.
-export const replaceUnresponsiveInstance = async (autoScalingGroupName : string, metrics : ClusterMetrics) => {
+// Returns whether it marked one, so nothing else is replaced in the same run.
+export const replaceUnresponsiveInstance = async (autoScalingGroupName : string, metrics : ClusterMetrics) : Promise<boolean> => {
     // Instances still booting have not published yet (metricAgeSeconds is null) and are left alone
     const reporting = metrics.instances
         .filter(i => metrics.inServiceInstanceIds.includes(i.instanceId))
@@ -19,14 +20,14 @@ export const replaceUnresponsiveInstance = async (autoScalingGroupName : string,
     const unresponsive = reporting.filter(isUnresponsive)
 
     if (unresponsive.length == 0) {
-        return
+        return false
     }
 
     // When several instances go quiet at once the cause is more likely CloudWatch or the network
     // than the instances themselves, so don't replace the whole group
     if (reporting.length > 1 && unresponsive.length == reporting.length) {
         console.log(`All ${reporting.length} instances stopped publishing job counts; not replacing any`)
-        return
+        return false
     }
 
     const instance = unresponsive
@@ -44,8 +45,10 @@ export const replaceUnresponsiveInstance = async (autoScalingGroupName : string,
         })
         console.log(`Marking instance ${instance.instanceId} unhealthy: no job count for ${instance.metricAgeSeconds}s`)
         await client.send(command)
+        return true
     } catch (ex) {
         // Don't fail the run; scaling has already been adjusted and the next run tries again
         console.log(`Could not mark instance ${instance.instanceId} unhealthy: ${ex}`)
+        return false
     }
 }

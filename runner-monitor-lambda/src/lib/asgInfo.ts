@@ -10,6 +10,12 @@ export interface AutoScalingGroupInfo {
     inServiceInstanceIds: string[]
     // instances currently protected from scale-in
     protectedInstanceIds: string[]
+    // instances the group has marked unhealthy and will replace
+    unhealthyInstanceIds: string[]
+    // instances launched from an older launch template version than the group's
+    outdatedInstanceIds: string[]
+    // autoscaling processes currently suspended on the group, such as AZRebalance
+    suspendedProcesses: string[]
 }
 
 export const getAutoscalingGroupInfo = async (autoScalingGroupName : string): Promise<AutoScalingGroupInfo> => {
@@ -60,12 +66,29 @@ export const getAutoscalingGroupInfo = async (autoScalingGroupName : string): Pr
         .filter(i => i.ProtectedFromScaleIn)
         .map((i) => i.InstanceId || "")
         .filter(i => i != "")
+    const unhealthyInstanceIds = activeInstances
+        .filter(i => i.HealthStatus != null && i.HealthStatus != "Healthy")
+        .map((i) => i.InstanceId || "")
+        .filter(i => i != "")
+    // The group launches from a numbered launch template version, so an instance on another
+    // version predates the last deploy that changed the template
+    const groupTemplateVersion = group.LaunchTemplate?.Version
+    const outdatedInstanceIds = activeInstances
+        .filter(i => groupTemplateVersion != null && i.LaunchTemplate?.Version != null
+            && i.LaunchTemplate.Version != groupTemplateVersion)
+        .map((i) => i.InstanceId || "")
+        .filter(i => i != "")
 
     return {
         autoScalingGroupName: autoScalingGroupName,
         instanceIds: activeInstanceIds,
         inServiceInstanceIds: inServiceInstanceIds,
         protectedInstanceIds: protectedInstanceIds,
+        unhealthyInstanceIds: unhealthyInstanceIds,
+        outdatedInstanceIds: outdatedInstanceIds,
+        suspendedProcesses: (group.SuspendedProcesses ?? [])
+            .map(p => p.ProcessName || "")
+            .filter(p => p != ""),
         maxSize: group.MaxSize,
         minSize: group.MinSize,
         currentCapacity: group.DesiredCapacity,

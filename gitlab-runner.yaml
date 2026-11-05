@@ -299,7 +299,8 @@ Resources:
                 listen_address = "127.0.0.1:9252"
                 log_format = "json"
             # Publishes this instance's running job count for the runner monitor Lambda to scale on,
-            # and its CPU, memory, swap and memory pressure for watch-runner-jobs.sh
+            # its root volume use for the monitor to replace a full warm instance, and its CPU,
+            # memory, swap and memory pressure for watch-runner-jobs.sh
             /usr/local/bin/publish-runner-metrics:
               mode: '000755'
               content: !Sub |
@@ -324,11 +325,13 @@ Resources:
                 SWAP=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { printf "%.1f", t ? (t - f) * 100 / t : 0 }' /proc/meminfo)
                 # % of the last 10s in which every task was stalled waiting for memory (thrashing)
                 PRESSURE=$(awk '/^full/ { sub("avg10=", "", $2); print $2 }' /proc/pressure/memory 2> /dev/null || echo 0)
+                # % of the root volume in use; Docker's images and volumes are on it
+                DISK=$(df --output=pcent / | tail -n 1 | tr -dc '0-9')
                 DIMENSIONS='[{"Name": "AutoScalingGroupName", "Value": "${AWS::StackName}-asg"}, {"Name": "InstanceId", "Value": "'"${!INSTANCE_ID}"'"}]'
                 metric() {
                   printf '{"MetricName": "${AWS::StackName}-instance-%s", "Dimensions": %s, "Unit": "%s", "Value": %s}' "$1" "${!DIMENSIONS}" "$2" "$3"
                 }
-                DATA="$(metric job-count Count "${!JOB_COUNT}"), $(metric memory Percent "${!MEMORY}"), $(metric swap Percent "${!SWAP}"), $(metric memory-pressure Percent "${!PRESSURE:-0}")"
+                DATA="$(metric job-count Count "${!JOB_COUNT}"), $(metric memory Percent "${!MEMORY}"), $(metric swap Percent "${!SWAP}"), $(metric memory-pressure Percent "${!PRESSURE:-0}"), $(metric disk Percent "${!DISK:-0}")"
                 if [ -n "${!CPU}" ]; then
                   DATA="${!DATA}, $(metric cpu Percent "${!CPU}")"
                 fi
@@ -456,10 +459,11 @@ Resources:
         MaxBatchSize: !Ref MaxBatchSize
         PauseTime: "PT15M"
         WaitOnResourceSignals: true
+        # AZRebalance is left out: an update resumes what it suspends, and the runner monitor
+        # keeps AZRebalance suspended permanently
         SuspendProcesses:
           - HealthCheck
           - ReplaceUnhealthy
-          - AZRebalance
           - AlarmNotification
           - ScheduledActions
     Properties:
@@ -632,6 +636,10 @@ Resources:
                   - "autoscaling:SetDesiredCapacity"
                   - "autoscaling:SetInstanceHealth"
                   - "autoscaling:SetInstanceProtection"
+                  # Keeps AZRebalance suspended (see runner-monitor-lambda/src/lib/suspendRebalance.ts)
+                  - "autoscaling:SuspendProcesses"
+                  # Launch times, to keep the oldest instances warm (see runner-monitor-lambda/src/lib/warmInstances.ts)
+                  - "ec2:DescribeInstances"
                   - "cloudwatch:GetMetricData"
                   - "cloudwatch:PutMetricData"
                 Resource:
@@ -664,6 +672,7 @@ Resources:
           COUNT_OF_NEW_JOBS_BEFORE_SCALING: !Ref CountOfNewJobsBeforeScaling
           RUNNER_METRIC_NAMESPACE: !Sub "${AWS::StackName}-runner-metrics"
           RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-instance-job-count"
+          RUNNER_INSTANCE_DISK_METRIC_NAME: !Sub "${AWS::StackName}-instance-disk"
           RUNNER_JOB_COUNT_METRIC_NAME: !Sub "${AWS::StackName}-job-count"
           RUNNER_TARGET_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-target-capacity"
           RUNNER_ACTUAL_CAPACITY_METRIC_NAME: !Sub "${AWS::StackName}-actual-capacity"

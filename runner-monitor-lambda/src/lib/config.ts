@@ -43,6 +43,12 @@ export const runnerInstanceJobCountMetricName = () : string => {
     throw Error("Environment Variable RUNNER_INSTANCE_JOB_COUNT_METRIC_NAME not found")
 }
 
+// per-instance % of the root volume in use, published by each runner instance; optional, so a
+// stack deployed before it existed still scales
+export const runnerInstanceDiskMetricName = () : string | null => {
+    return process.env.RUNNER_INSTANCE_DISK_METRIC_NAME || null
+}
+
 export const runnerJobCountMetricName = () : string => {
     if (process.env.RUNNER_JOB_COUNT_METRIC_NAME) {
         return process.env.RUNNER_JOB_COUNT_METRIC_NAME

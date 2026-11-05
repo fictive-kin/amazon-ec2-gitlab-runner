@@ -238,7 +238,7 @@ fi
 
 # metric_queries <instance-id>...  -> MetricDataQueries JSON for the cluster and each instance.
 # Instance query IDs are a metric letter and the instance's index: j0 (jobs), c0 (CPU), m0 (memory),
-# s0 (swap), p0 (memory pressure).
+# s0 (swap), p0 (memory pressure), d0 (root volume use).
 metric_queries() {
     jq -n --arg ns "${metric_namespace}" --arg stack "${stack_name}" --arg asg "${asg_name}" \
         --argjson ids "$(printf '%s\n' "$@" | jq -R . | jq -s 'map(select(. != ""))')" '
@@ -249,7 +249,7 @@ metric_queries() {
         + ($ids | to_entries | map(
             [{Name: "AutoScalingGroupName", Value: $asg}, {Name: "InstanceId", Value: .value}] as $dims
             | .key as $i
-            | {j: "job-count", c: "cpu", m: "memory", s: "swap", p: "memory-pressure"} | to_entries
+            | {j: "job-count", c: "cpu", m: "memory", s: "swap", p: "memory-pressure", d: "disk"} | to_entries
             | map(query("\(.key)\($i)"; "\($stack)-instance-\(.value)"; $dims))) | add // [])'
 }
 
@@ -300,7 +300,7 @@ render() {
     echo "Capacity  desired $(echo "${asg}" | jq -r .DesiredCapacity)  min $(echo "${asg}" | jq -r .MinSize)  max $(echo "${asg}" | jq -r .MaxSize)  target ${target:--}    Running jobs (CloudWatch) ${BOLD}${total:--}${RESET}  Waiting ${BOLD}${pending:--}${RESET}"
     echo
 
-    echo "${BOLD}$(pad 21 INSTANCE) $(pad 20 STATE) $(pad 10 HEALTH) $(pad 16 IP) $(pad 8 UP) $(pad 6 CPU) $(pad 6 MEM) $(pad 6 SWAP) $(pad 6 PSI) JOBS${RESET}"
+    echo "${BOLD}$(pad 21 INSTANCE) $(pad 20 STATE) $(pad 10 HEALTH) $(pad 16 IP) $(pad 8 UP) $(pad 6 CPU) $(pad 6 MEM) $(pad 6 SWAP) $(pad 6 PSI) $(pad 6 DISK) JOBS${RESET}"
     if [[ -z "${instance_ids}" ]]; then
         echo "${DIM}(no instances)${RESET}"
     fi
@@ -328,6 +328,8 @@ render() {
         [[ "${health}" != "Healthy" ]] && health_color=${RED}
         resources="$(percent_cell "$(latest "c${index}" | cut -d' ' -f1)" 90 101) $(percent_cell "$(latest "m${index}" | cut -d' ' -f1)" 85 95)"
         resources+=" $(percent_cell "$(latest "s${index}" | cut -d' ' -f1)" 25 50) $(percent_cell "$(latest "p${index}" | cut -d' ' -f1)" 10 30)"
+        # The runner monitor replaces a warm instance once its root volume is 85% full
+        resources+=" $(percent_cell "$(latest "d${index}" | cut -d' ' -f1)" 75 85)"
         echo "$(pad 21 "${id}") $(pad 20 "${state}" "${state_color}") $(pad 10 "${health}" "${health_color}") $(pad 16 "${ip}") $(pad 8 "${up}") ${resources} ${jobs_cell}"
         index=$((index + 1))
     done

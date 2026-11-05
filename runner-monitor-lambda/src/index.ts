@@ -24,6 +24,8 @@ import {adjustScaling} from "./lib/adjustScaling";
 import {replaceUnresponsiveInstance} from "./lib/replaceUnresponsive";
 import {protectBusyInstances} from "./lib/protectBusyInstances";
 import {countPendingJobs} from "./lib/pendingJobs";
+import {suspendAzRebalance} from "./lib/suspendRebalance";
+import {replaceProblemWarmInstance, selectWarmInstances} from "./lib/warmInstances";
 
 export const handler = async (event : lambda.ScheduledEvent, context : lambda.Context | null) : Promise<void> => {
     const autoScalingGroupName = config.autoScalingGroupName()
@@ -41,15 +43,24 @@ export const handler = async (event : lambda.ScheduledEvent, context : lambda.Co
     console.log(`Publishing metrics`)
     await publishMetrics(metrics, pendingJobCount, desiredCapacity)
 
-    // Before scaling, so a scale-in removes idle instances
+    // Before scaling, so evening out the zones after a scale-in doesn't launch instances
+    await suspendAzRebalance(autoScalingGroupName, metrics)
+
+    // Before scaling, so a scale-in removes idle instances other than the warm ones
+    console.log(`Selecting warm instances`)
+    const warm = await selectWarmInstances(metrics)
     console.log(`Updating scale-in protection`)
-    await protectBusyInstances(autoScalingGroupName, metrics)
+    await protectBusyInstances(autoScalingGroupName, metrics, warm.warmInstanceIds)
 
     console.log(`Adjusting autoscaling`)
     await adjustScaling(autoScalingGroupName, metrics, desiredCapacity)
 
     console.log(`Checking for unresponsive instances`)
-    await replaceUnresponsiveInstance(autoScalingGroupName, metrics)
+    const replacedUnresponsive = await replaceUnresponsiveInstance(autoScalingGroupName, metrics)
+
+    if (!replacedUnresponsive) {
+        await replaceProblemWarmInstance(metrics, warm)
+    }
 
     console.log(`Done`)
 }

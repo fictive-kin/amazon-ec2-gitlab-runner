@@ -87,8 +87,11 @@ else
   echo "No AWS profile was provided, so the AWS CLI's default credentials are used."
 fi
 
+# The runner monitor keeps the warm instance and busy ones protected from scale-in, which a refresh
+# skips by default; replace them too, since the lifecycle hook lets their jobs finish
 aws autoscaling start-instance-refresh \
   --auto-scaling-group-name="${AutoScalingGroupName}" \
+  --preferences '{"ScaleInProtectedInstances": "Refresh"}' \
   --region="${region}" \
   ${profile_args[@]+"${profile_args[@]}"}
 
